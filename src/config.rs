@@ -265,6 +265,9 @@ pub struct CameraConfig {
     pub pip_enabled: bool,
     /// Inset render target size in pixels as `[width, height]` (needs a restart).
     pub pip_size: [f32; 2],
+    /// Inset camera offset as `[lateral, up, behind]` measured against the
+    /// gimbal's horizontal aim.
+    pub pip_offset: [f32; 3],
     /// Distance from the bottom-right corner in pixels.
     pub pip_margin: f32,
     /// Inset opacity, `0.0..=1.0`.
@@ -284,6 +287,7 @@ impl Default for CameraConfig {
             mouse_sensitivity: 0.003,
             pip_enabled: true,
             pip_size: [320.0, 180.0],
+            pip_offset: [0.0, 1.0, 4.5],
             pip_margin: 16.0,
             pip_opacity: 0.8,
             pip_refresh_divisor: 2,
@@ -509,6 +513,7 @@ mod tests {
         let camera = CameraConfig::default();
 
         assert_eq!(camera.pip_size, [320.0, 180.0]);
+        assert_eq!(camera.pip_offset, [0.0, 1.0, 4.5]);
         assert_eq!(camera.pip_refresh_divisor, 2, "每 2 帧渲染一次，减半开销");
         assert_eq!(camera.pip_far, 60.0);
     }

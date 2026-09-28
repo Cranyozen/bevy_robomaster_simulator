@@ -6,19 +6,18 @@ pub struct MainCamera {
     pub follow_offset: Vec3,
 }
 
-/// Off-screen camera rendering the third-person inset.
+/// Off-screen camera rendering the gimbal-following inset: it sits behind the
+/// robot's aim (see `pip_offset`) and looks exactly where the first-person view
+/// looks, so the inset turns with the turret.
 #[derive(Component)]
 pub struct PictureInPicture {
-    /// Third-person offset in the robot's local space, captured at startup.
-    pub follow_offset: Vec3,
     frame: u64,
     was_visible: bool,
 }
 
 impl PictureInPicture {
-    pub fn new(follow_offset: Vec3) -> Self {
+    pub fn new() -> Self {
         Self {
-            follow_offset,
             frame: 0,
             was_visible: false,
         }
@@ -125,7 +124,7 @@ mod tests {
 
     #[test]
     fn inset_tick_renders_every_divisor_frames_and_immediately_when_shown() {
-        let mut inset = PictureInPicture::new(Vec3::ZERO);
+        let mut inset = PictureInPicture::new();
 
         // Hidden: the extra pass never runs.
         assert!(!inset.tick(false, 2));

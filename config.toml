@@ -104,7 +104,7 @@ wind = [0.0, 0.0, 0.0]          # m/s - wind velocity in world coordinates
 [camera]
 fov = 45.0                      # degrees - field of view
 free_move_speed = 8.0           # m/s - free camera movement speed
-follow_offset = [0.0, 3.0, 2.0] # follow camera offset (also used by the inset)
+follow_offset = [0.0, 3.0, 2.0] # third-person follow camera offset
 mouse_sensitivity = 0.003       # mouse look sensitivity
 
 # Third-person inset in the bottom-right corner, shown while the main view is
@@ -113,6 +113,7 @@ mouse_sensitivity = 0.003       # mouse look sensitivity
 # every `pip_refresh_divisor` frames and culls beyond `pip_far`.
 pip_enabled = true              # master switch for the inset
 pip_size = [320.0, 180.0]       # px - inset render target size (restart required)
+pip_offset = [0.0, 1.0, 4.5]    # [lateral, up, behind] - boom against the gimbal's horizontal aim
 pip_margin = 16.0               # px - distance from the bottom-right corner
 pip_opacity = 0.8               # 0.0..=1.0 - inset opacity
 pip_refresh_divisor = 2         # render the inset every N frames (1 = every frame)

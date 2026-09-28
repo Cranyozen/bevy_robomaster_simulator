@@ -152,7 +152,7 @@ pub fn setup_picture_in_picture(
         Tonemapping::None,
         Msaa::Off,
         Transform::from_xyz(0.0, 3.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
-        PictureInPicture::new(Vec3::from_array(config.camera.follow_offset)),
+        PictureInPicture::new(),
     ));
 
     commands.spawn((
@@ -187,6 +187,40 @@ fn inset_tint(camera: &CameraConfig) -> Color {
     Color::srgba(1.0, 1.0, 1.0, camera.pip_opacity.clamp(0.0, 1.0))
 }
 
+/// First-person view direction of the robot, i.e. where the gimbal aims. Matches
+/// the main camera's `FollowingType::Robot` orientation and `projectile_launch`.
+fn inset_aim(root: &Transform, gimbal: &Transform, launch_offset: &Transform) -> Vec3 {
+    (root.rotation * gimbal.rotation * launch_offset.rotation)
+        .mul_vec3(Vec3::Y)
+        .normalize_or_zero()
+}
+
+/// Camera offset from the robot root as `[lateral, up, behind]`, measured against
+/// the gimbal's **horizontal** aim so the boom swings with the turret without
+/// dipping into the ground when the gimbal pitches.
+fn inset_boom(aim: Vec3, offset: Vec3) -> Vec3 {
+    let horizontal = Vec3::new(aim.x, 0.0, aim.z).normalize_or_zero();
+    let forward = if horizontal == Vec3::ZERO {
+        Vec3::NEG_Z
+    } else {
+        horizontal
+    };
+    let right = forward.cross(Vec3::Y);
+
+    Vec3::Y * offset.y + right * offset.x - forward * offset.z
+}
+
+/// One node of a robot hierarchy: the root, its gimbal or its muzzle, together
+/// with the marker that says which camera focus owns it.
+type RobotPart<'a> = (
+    &'a Transform,
+    Option<&'a Infantry>,
+    Option<&'a InfantryGimbal>,
+    Option<&'a InfantryLaunchOffset>,
+    Option<&'a Controlled>,
+    Option<&'a ActiveSlapper>,
+);
+
 /// Shows the inset only while the main view is first-person and follows the same
 /// robot as the main camera (own robot, or the active slapper). The inset pass is
 /// skipped on frames outside `pip_refresh_divisor` so it only costs a fraction of
@@ -197,9 +231,12 @@ pub fn update_picture_in_picture(
     focus: Res<CameraFocus>,
     state: Res<PictureInPictureState>,
     camera: Single<(&mut PictureInPicture, &mut Transform, &mut Camera), With<PictureInPicture>>,
-    roots: Query<
-        (&Transform, Option<&Controlled>, Option<&ActiveSlapper>),
-        (With<Infantry>, Without<PictureInPicture>),
+    parts: Query<
+        RobotPart,
+        (
+            Without<PictureInPicture>,
+            Or<(With<Controlled>, With<ActiveSlapper>)>,
+        ),
     >,
     inset: Single<(&mut Node, &mut ImageNode), With<PictureInPictureNode>>,
 ) {
@@ -238,17 +275,35 @@ pub fn update_picture_in_picture(
         return;
     }
 
-    let target = roots.iter().find(|(_, controlled, active)| match *focus {
-        CameraFocus::Own => controlled.is_some(),
-        CameraFocus::Slapper => active.is_some(),
-    });
-    let Some((root, _, _)) = target else {
+    let mut root = None;
+    let mut gimbal = None;
+    let mut launch_offset = None;
+    for (transform, infantry, infantry_gimbal, launch, controlled, slapper) in &parts {
+        let follows_focus = match *focus {
+            CameraFocus::Own => controlled.is_some(),
+            CameraFocus::Slapper => slapper.is_some(),
+        };
+        if !follows_focus {
+            continue;
+        }
+        if infantry.is_some() {
+            root = Some(transform);
+        } else if infantry_gimbal.is_some() {
+            gimbal = Some(transform);
+        } else if launch.is_some() {
+            launch_offset = Some(transform);
+        }
+    }
+    let (Some(root), Some(gimbal), Some(launch_offset)) = (root, gimbal, launch_offset) else {
         return;
     };
 
-    let offset = root.rotation * pip.follow_offset;
-    camera_transform.translation = root.translation + offset;
-    camera_transform.look_at(root.translation, Vec3::Y);
+    // The inset hangs behind the gimbal's aim and looks where the first-person
+    // view looks, so turning the turret turns the inset view too.
+    let aim = inset_aim(root, gimbal, launch_offset);
+    let boom = inset_boom(aim, Vec3::from_array(config.camera.pip_offset));
+    camera_transform.translation = root.translation + boom;
+    camera_transform.look_at(root.translation + boom + aim, Vec3::Y);
 }
 
 pub fn freecam_controls(
@@ -398,5 +453,40 @@ mod tests {
 
         assert_eq!(inset_size(&oversized), UVec2::new(1, 1));
         assert_eq!(inset_tint(&oversized), Color::srgba(1.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn inset_aim_matches_the_first_person_view_direction() {
+        let root = Transform::from_rotation(Quat::from_rotation_y(0.7));
+        let gimbal = Transform::from_rotation(Quat::from_euler(EulerRot::YXZ, 0.4, -0.3, 0.0));
+        let launch_offset = Transform::from_rotation(Quat::from_rotation_x(-0.2));
+
+        let gimbal_world_rotation = root.rotation * gimbal.rotation;
+        let mut first_person = Transform::IDENTITY;
+        first_person.rotation = (gimbal_world_rotation
+            * launch_offset.rotation
+            * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0))
+        .normalize();
+
+        let aim = inset_aim(&root, &gimbal, &launch_offset);
+
+        assert!(
+            first_person.forward().dot(aim) > 0.9999,
+            "the inset must look where the first-person view looks"
+        );
+    }
+
+    #[test]
+    fn inset_boom_sits_behind_the_horizontal_aim() {
+        let offset = Vec3::new(0.0, 1.0, 4.5);
+
+        assert_eq!(inset_boom(Vec3::NEG_Z, offset), Vec3::new(0.0, 1.0, 4.5));
+        assert_eq!(inset_boom(Vec3::X, offset), Vec3::new(-4.5, 1.0, 0.0));
+        assert_eq!(
+            inset_boom(Vec3::NEG_Z, Vec3::new(1.0, 1.0, 4.5)),
+            Vec3::new(1.0, 1.0, 4.5)
+        );
+        // Aiming straight up keeps a sane boom instead of collapsing it.
+        assert_eq!(inset_boom(Vec3::Y, offset), Vec3::new(0.0, 1.0, 4.5));
     }
 }
