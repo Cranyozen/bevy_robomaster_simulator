@@ -11,7 +11,6 @@ use crate::components::{
 use crate::config::SimulationConfig;
 use crate::robomaster::prelude::{OutpostRoot, ScanArmor, Team};
 use crate::robomaster::vehicle::movement::VehicleDynamic;
-use crate::systems::spawn_text;
 use crate::util::entity_query::HierarchyQuery;
 use bevy_metalfx::{MetalFxTemporalUpscaling, UpscaleFactor};
 
@@ -26,7 +25,6 @@ pub fn setup(
     if let Some(mut egui_global_settings) = egui_global_settings {
         egui_global_settings.auto_create_primary_context = false;
     }
-    spawn_text(&mut commands);
     commands.spawn((
         DirectionalLight {
             color: Color::srgb(0.9, 0.95, 1.0),
@@ -186,15 +184,21 @@ pub fn setup_vehicle(
     ));
     let gimbal = iter.exact("GIMBAL").one().unwrap();
     commands.entity(gimbal).insert(InfantryGimbal::default());
-    if is_local {
-        let q = query.of(gimbal).flatten();
-        commands
-            .entity(q.clone().exact("SHOT_DIRECTION").one().unwrap())
-            .insert(InfantryLaunchOffset);
-        commands
-            .entity(q.exact("CAM_DIRECTION").one().unwrap())
-            .insert(InfantryViewOffset);
-    }
+    // Slappers carry these markers too so the camera can follow them (see
+    // `CameraFocus`); both robot models expose the nodes under `GIMBAL`.
+    let gimbal_markers = query.of(gimbal).flatten();
+    commands
+        .entity(
+            gimbal_markers
+                .clone()
+                .exact("SHOT_DIRECTION")
+                .one()
+                .unwrap(),
+        )
+        .insert(InfantryLaunchOffset);
+    commands
+        .entity(gimbal_markers.exact("CAM_DIRECTION").one().unwrap())
+        .insert(InfantryViewOffset);
 }
 
 /// Queues Avian collider construction for the named nodes of a loaded world.

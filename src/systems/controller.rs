@@ -9,27 +9,38 @@ const GAMEPAD_STICK_DEADZONE: f32 = 0.12;
 const GAMEPAD_TRIGGER_THRESHOLD: f32 = 0.35;
 const PRECISE_GIMBAL_SCALE: f32 = 0.35;
 
+/// Last input device that produced a binding. The help HUD renders the matching
+/// key table from `systems/help.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSource {
+    Keyboard,
+    Xbox,
+}
+
+impl InputSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Keyboard => "keyboard",
+            Self::Xbox => "xbox",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControllerHelp {
-    source: &'static str,
-    manual: &'static str,
-    auto_aim: &'static str,
+    source: InputSource,
 }
 
 impl ControllerHelp {
     const fn keyboard() -> Self {
         Self {
-            source: "keyboard",
-            manual: "F3 Camera | WASD Move | Arrows Aim | Space Shoot | G Dart | Q Gyro | U Remote Gyro | F5 AutoAim | Tab Slapper",
-            auto_aim: "F5 AutoAim Off | WASD Move | Q Gyro | U Remote Gyro | external fire_advice shoots | Tab Slapper",
+            source: InputSource::Keyboard,
         }
     }
 
     const fn xbox() -> Self {
         Self {
-            source: "xbox",
-            manual: "View Camera | LS Move | L3 Boost | DPad Slapper Move | RS Aim | R3+RS Slapper Roll/Pitch | LB Gyro | Y Slapper Gyro | RB Shoot | X Dart | hold RT AutoAim",
-            auto_aim: "release RT AutoAim Off | LS Move | L3 Boost | DPad Slapper Move | R3+RS Slapper Roll/Pitch | LB Gyro | Y Slapper Gyro | external fire_advice shoots",
+            source: InputSource::Xbox,
         }
     }
 }
@@ -80,6 +91,7 @@ pub struct ControllerInput {
     pub dart_just_pressed: bool,
     pub switch_slapper_just_pressed: bool,
     pub switch_camera_just_pressed: bool,
+    pub switch_focus_just_pressed: bool,
     pub auto_aim: bool,
 }
 
@@ -97,6 +109,7 @@ impl Default for ControllerInput {
             dart_just_pressed: false,
             switch_slapper_just_pressed: false,
             switch_camera_just_pressed: false,
+            switch_focus_just_pressed: false,
             auto_aim: false,
         }
     }
@@ -151,24 +164,8 @@ impl ControllerState {
         self.keyboard_auto_aim || self.controlled.auto_aim
     }
 
-    pub fn help_source(&self) -> &'static str {
+    pub fn help_source(&self) -> InputSource {
         self.help.source
-    }
-
-    pub fn help_mode(&self) -> &'static str {
-        if self.auto_aim_active() {
-            "auto-aim"
-        } else {
-            "manual"
-        }
-    }
-
-    pub fn help_controls(&self) -> &'static str {
-        if self.auto_aim_active() {
-            self.help.auto_aim
-        } else {
-            self.help.manual
-        }
     }
 
     pub fn controlled_chassis_spin(&self) -> bool {
@@ -247,6 +244,7 @@ pub fn sample_keyboard_controller(
     controlled.dart_just_pressed |= keyboard.just_pressed(KeyCode::KeyG);
     controlled.switch_slapper_just_pressed |= keyboard.just_pressed(KeyCode::Tab);
     controlled.switch_camera_just_pressed |= keyboard.just_pressed(KeyCode::F3);
+    controlled.switch_focus_just_pressed |= keyboard.just_pressed(KeyCode::KeyO);
 
     let remote_chassis_yaw = controller.remote_chassis_spin.yaw_input();
     let remote = &mut controller.remote;
@@ -340,6 +338,7 @@ pub fn sample_gamepad_controller(
     controlled.dart_just_pressed |= gamepad.just_pressed(GamepadButton::West);
     controlled.switch_slapper_just_pressed |= gamepad.just_pressed(GamepadButton::Start);
     controlled.switch_camera_just_pressed |= gamepad.just_pressed(GamepadButton::Select);
+    controlled.switch_focus_just_pressed |= gamepad.just_pressed(GamepadButton::South);
 
     let remote = &mut controller.remote;
     remote.add_movement(-dpad);
@@ -455,13 +454,14 @@ fn keyboard_controller_active(keyboard: &ButtonInput<KeyCode>) -> bool {
         KeyCode::KeyF,
         KeyCode::KeyV,
     ];
-    const EDGE_KEYS: [KeyCode; 6] = [
+    const EDGE_KEYS: [KeyCode; 7] = [
         KeyCode::KeyG,
         KeyCode::Tab,
         KeyCode::F3,
         KeyCode::F5,
         KeyCode::KeyQ,
         KeyCode::KeyU,
+        KeyCode::KeyO,
     ];
 
     HELD_KEYS.iter().any(|&key| keyboard.pressed(key))
@@ -485,6 +485,7 @@ fn gamepad_controller_active(
         || gamepad.pressed(GamepadButton::RightTrigger)
         || gamepad.just_pressed(GamepadButton::North)
         || gamepad.just_pressed(GamepadButton::West)
+        || gamepad.just_pressed(GamepadButton::South)
         || gamepad.just_pressed(GamepadButton::Start)
         || gamepad.just_pressed(GamepadButton::Select)
 }
@@ -530,17 +531,30 @@ mod tests {
     }
 
     #[test]
-    fn help_provider_switches_between_manual_and_auto_aim_modes() {
+    fn help_provider_switches_between_keyboard_and_gamepad_sources() {
         let mut controller = ControllerState::default();
+        assert_eq!(controller.help_source(), InputSource::Keyboard);
+        assert_eq!(controller.help_source().label(), "keyboard");
+
         controller.use_help(ControllerHelp::xbox());
 
-        assert_eq!(controller.help_source(), "xbox");
-        assert_eq!(controller.help_mode(), "manual");
-        assert!(controller.help_controls().contains("hold RT"));
+        assert_eq!(controller.help_source(), InputSource::Xbox);
+        assert_eq!(controller.help_source().label(), "xbox");
+    }
+
+    #[test]
+    fn auto_aim_follows_both_keyboard_toggle_and_gamepad_hold() {
+        let mut controller = ControllerState::default();
+        assert!(!controller.auto_aim_active());
+
+        controller.toggle_keyboard_auto_aim();
+        assert!(controller.auto_aim_active());
+
+        controller.toggle_keyboard_auto_aim();
+        assert!(!controller.auto_aim_active());
 
         controller.controlled.auto_aim = true;
-        assert_eq!(controller.help_mode(), "auto-aim");
-        assert!(controller.help_controls().contains("release RT"));
+        assert!(controller.auto_aim_active());
     }
 
     #[test]
@@ -550,7 +564,7 @@ mod tests {
 
         controller.reset_frame();
 
-        assert_eq!(controller.help_source(), "xbox");
+        assert_eq!(controller.help_source(), InputSource::Xbox);
     }
 
     #[test]

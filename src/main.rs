@@ -27,20 +27,23 @@ use bevy_inspector_egui::bevy_egui::EguiPlugin;
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use std::sync::atomic::AtomicBool;
 
-use crate::components::{CameraMode, FollowingType, ProjectileCooldown, SubscribeAutoAim};
+use crate::components::{
+    CameraFocus, CameraMode, FollowingType, ProjectileCooldown, SubscribeAutoAim,
+};
 use crate::config::{ConfigPlugin, SimulationConfig};
 use crate::handler::{on_activate, on_hit};
 use crate::robomaster::prelude::RoboMasterPlugins;
 use crate::setup::setup;
 use crate::statistic::ProjectileStatistics;
 use crate::systems::{
-    ChassisObservationFrame, ControllerState, GameplaySystems, PreviousKinematicState,
+    ChassisObservationFrame, ControllerState, GameplaySystems, HelpPlugin, PreviousKinematicState,
     change_appearance, cleanup_projectiles, clear_controller_input, controller_dart_just_pressed,
-    controller_shoot_pressed, dart_launch, following_controls, freecam_controls, gimbal_controls,
-    gimbal_pid_controls, projectile_aerodynamics, projectile_launch, remote_gimbal_controls,
-    remote_vehicle_controls, sample_gamepad_controller, sample_keyboard_controller,
-    screenshot_on_f2, screenshot_saving, setup_projectile, switch_slapper_control, uav_launch,
-    update_auto_aim_subscription, update_chassis_observation, update_help_text, vehicle_controls,
+    controller_shoot_pressed, dart_launch, focus_controls, following_controls, freecam_controls,
+    gimbal_controls, gimbal_pid_controls, projectile_aerodynamics, projectile_launch,
+    remote_gimbal_controls, remote_vehicle_controls, sample_gamepad_controller,
+    sample_keyboard_controller, screenshot_on_f2, screenshot_saving, setup_projectile,
+    switch_slapper_control, uav_launch, update_auto_aim_subscription, update_camera_follow,
+    update_camera_follow_slapper, update_chassis_observation, vehicle_controls,
 };
 use bevy_metalfx::MetalFxPlugin;
 
@@ -139,9 +142,11 @@ fn main() {
 
     app.add_plugins(RoboMasterPlugins)
         .add_plugins(MetalFxPlugin)
+        .add_plugins(HelpPlugin)
         .add_plugins(crate::scene::ScenePlugin)
         .add_plugins(ConfigPlugin)
         .init_resource::<CameraMode>()
+        .init_resource::<CameraFocus>()
         .init_resource::<ProjectileStatistics>()
         .init_resource::<ChassisObservationFrame>()
         .init_resource::<PreviousKinematicState>()
@@ -178,6 +183,7 @@ fn main() {
                     sample_gamepad_controller,
                     update_auto_aim_subscription,
                     following_controls,
+                    focus_controls,
                     switch_slapper_control,
                     vehicle_controls.run_if(|mode: Res<CameraMode>| mode.0 != FollowingType::Free),
                     remote_vehicle_controls,
@@ -190,12 +196,16 @@ fn main() {
                     .chain()
                     .in_set(GameplaySystems::Input),
                 // GameLogic phase
-                (change_appearance, update_help_text).in_set(GameplaySystems::GameLogic),
+                change_appearance.in_set(GameplaySystems::GameLogic),
                 // Camera phase
                 (
                     freecam_controls.run_if(|mode: Res<CameraMode>| mode.0 == FollowingType::Free),
-                    systems::update_camera_follow
-                        .run_if(|mode: Res<CameraMode>| mode.0 != FollowingType::Free),
+                    update_camera_follow
+                        .run_if(|mode: Res<CameraMode>| mode.0 != FollowingType::Free)
+                        .run_if(|focus: Res<CameraFocus>| *focus == CameraFocus::Own),
+                    update_camera_follow_slapper
+                        .run_if(|mode: Res<CameraMode>| mode.0 != FollowingType::Free)
+                        .run_if(|focus: Res<CameraFocus>| *focus == CameraFocus::Slapper),
                 )
                     .in_set(GameplaySystems::Camera)
                     .before(RenderSystems::Render),

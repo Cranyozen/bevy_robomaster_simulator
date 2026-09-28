@@ -3,8 +3,8 @@ use bevy::prelude::*;
 use std::f32::consts::PI;
 
 use crate::components::{
-    CameraMode, Controlled, FollowingType, Infantry, InfantryGimbal, InfantryLaunchOffset,
-    InfantryViewOffset, MainCamera,
+    ActiveSlapper, CameraFocus, CameraMode, Controlled, FollowingType, Infantry, InfantryGimbal,
+    InfantryLaunchOffset, InfantryViewOffset, MainCamera,
 };
 use crate::config::SimulationConfig;
 use crate::systems::ControllerState;
@@ -19,6 +19,43 @@ pub fn following_controls(mut mode: ResMut<CameraMode>, controller: Res<Controll
     }
 }
 
+pub fn focus_controls(controller: Res<ControllerState>, mut focus: ResMut<CameraFocus>) {
+    if controller.controlled.switch_focus_just_pressed {
+        focus.toggle();
+    }
+}
+
+/// Frames the camera on one robot. `infantry`, `gimbal`, `view_offset` and
+/// `launch_offset` all belong to the same robot hierarchy.
+fn apply_follow(
+    camera: &mut Transform,
+    follow_offset: Vec3,
+    mode: FollowingType,
+    infantry: &Transform,
+    gimbal: &Transform,
+    view_offset: &Transform,
+    launch_offset: &Transform,
+) {
+    match mode {
+        FollowingType::Robot => {
+            let gimbal_world_rotation = infantry.rotation * gimbal.rotation;
+            let view_offset_world = gimbal_world_rotation * view_offset.translation;
+
+            camera.translation = infantry.translation + view_offset_world;
+            camera.rotation = (gimbal_world_rotation
+                * launch_offset.rotation
+                * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0))
+            .normalize()
+        }
+        FollowingType::ThirdPerson => {
+            let offset = infantry.rotation * follow_offset;
+            camera.translation = infantry.translation + offset;
+            camera.look_at(infantry.translation, Vec3::Y);
+        }
+        FollowingType::Free => {}
+    }
+}
+
 pub fn update_camera_follow(
     camera_query: Single<(&mut Transform, &MainCamera), Without<Controlled>>,
     infantry: Single<&Transform, (With<Infantry>, With<Controlled>)>,
@@ -27,29 +64,48 @@ pub fn update_camera_follow(
     launch_offset: Single<&Transform, (With<Controlled>, With<InfantryLaunchOffset>)>,
     mode: Res<CameraMode>,
 ) {
-    let gimbal_transform = gimbal.into_inner();
-    let (mut camera_transform, camera_offset) = camera_query.into_inner();
+    let (mut camera, main_camera) = camera_query.into_inner();
+    apply_follow(
+        &mut camera,
+        main_camera.follow_offset,
+        mode.0,
+        infantry.into_inner(),
+        gimbal.into_inner(),
+        view_offset.into_inner(),
+        launch_offset.into_inner(),
+    );
+}
 
-    match mode.0 {
-        FollowingType::Robot => {
-            let view_offset_transform = view_offset.into_inner();
-            let gimbal_world_rotation = infantry.rotation * gimbal_transform.rotation;
-            let view_offset_world = gimbal_world_rotation * view_offset_transform.translation;
+/// Follows the active slapper. Queries instead of `Single` so that a scene
+/// without an active slapper (or one that is still loading) keeps the camera
+/// where it is instead of panicking.
+pub fn update_camera_follow_slapper(
+    camera_query: Single<(&mut Transform, &MainCamera), Without<ActiveSlapper>>,
+    infantry: Query<&Transform, (With<Infantry>, With<ActiveSlapper>)>,
+    gimbal: Query<&Transform, (With<ActiveSlapper>, With<InfantryGimbal>)>,
+    view_offset: Query<&Transform, (With<ActiveSlapper>, With<InfantryViewOffset>)>,
+    launch_offset: Query<&Transform, (With<ActiveSlapper>, With<InfantryLaunchOffset>)>,
+    mode: Res<CameraMode>,
+) {
+    let (Ok(infantry), Ok(gimbal), Ok(view_offset), Ok(launch_offset)) = (
+        infantry.single(),
+        gimbal.single(),
+        view_offset.single(),
+        launch_offset.single(),
+    ) else {
+        return;
+    };
 
-            camera_transform.translation = infantry.translation + view_offset_world;
-            camera_transform.rotation = (gimbal_world_rotation
-                * launch_offset.rotation
-                * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0))
-            .normalize()
-        }
-        FollowingType::ThirdPerson => {
-            let base_transform = infantry.into_inner();
-            let offset = base_transform.rotation * camera_offset.follow_offset;
-            camera_transform.translation = base_transform.translation + offset;
-            camera_transform.look_at(base_transform.translation, Vec3::Y);
-        }
-        FollowingType::Free => {}
-    }
+    let (mut camera, main_camera) = camera_query.into_inner();
+    apply_follow(
+        &mut camera,
+        main_camera.follow_offset,
+        mode.0,
+        infantry,
+        gimbal,
+        view_offset,
+        launch_offset,
+    );
 }
 
 pub fn freecam_controls(
@@ -103,5 +159,77 @@ pub fn freecam_controls(
     }
     if keyboard.pressed(KeyCode::KeyJ) {
         camera_transform.translation -= up * speed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn robot(at: Vec3) -> (Transform, Transform, Transform, Transform) {
+        (
+            Transform::from_translation(at),
+            Transform::IDENTITY,
+            Transform::from_xyz(0.1, 0.2, 0.3),
+            Transform::IDENTITY,
+        )
+    }
+
+    #[test]
+    fn first_person_camera_lands_on_the_view_offset() {
+        let (infantry, gimbal, view_offset, launch_offset) = robot(Vec3::new(4.0, 1.0, -2.0));
+        let mut camera = Transform::IDENTITY;
+
+        apply_follow(
+            &mut camera,
+            Vec3::new(0.0, 3.0, 2.0),
+            FollowingType::Robot,
+            &infantry,
+            &gimbal,
+            &view_offset,
+            &launch_offset,
+        );
+
+        assert_eq!(
+            camera.translation,
+            infantry.translation + view_offset.translation
+        );
+    }
+
+    #[test]
+    fn third_person_camera_orbits_the_follow_offset_around_the_robot() {
+        let (infantry, gimbal, view_offset, launch_offset) = robot(Vec3::new(1.0, 1.0, 1.0));
+        let follow_offset = Vec3::new(0.0, 3.0, 2.0);
+        let mut camera = Transform::IDENTITY;
+
+        apply_follow(
+            &mut camera,
+            follow_offset,
+            FollowingType::ThirdPerson,
+            &infantry,
+            &gimbal,
+            &view_offset,
+            &launch_offset,
+        );
+
+        assert_eq!(camera.translation, infantry.translation + follow_offset);
+    }
+
+    #[test]
+    fn free_camera_is_left_untouched() {
+        let (infantry, gimbal, view_offset, launch_offset) = robot(Vec3::new(1.0, 1.0, 1.0));
+        let mut camera = Transform::from_xyz(9.0, 9.0, 9.0);
+
+        apply_follow(
+            &mut camera,
+            Vec3::new(0.0, 3.0, 2.0),
+            FollowingType::Free,
+            &infantry,
+            &gimbal,
+            &view_offset,
+            &launch_offset,
+        );
+
+        assert_eq!(camera.translation, Vec3::new(9.0, 9.0, 9.0));
     }
 }
