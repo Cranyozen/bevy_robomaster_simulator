@@ -28,7 +28,8 @@ use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use std::sync::atomic::AtomicBool;
 
 use crate::components::{
-    CameraFocus, CameraMode, FollowingType, ProjectileCooldown, SubscribeAutoAim,
+    CameraFocus, CameraMode, FollowingType, PictureInPictureState, ProjectileCooldown,
+    SubscribeAutoAim,
 };
 use crate::config::{ConfigPlugin, SimulationConfig};
 use crate::handler::{on_activate, on_hit};
@@ -39,11 +40,12 @@ use crate::systems::{
     ChassisObservationFrame, ControllerState, GameplaySystems, HelpPlugin, PreviousKinematicState,
     change_appearance, cleanup_projectiles, clear_controller_input, controller_dart_just_pressed,
     controller_shoot_pressed, dart_launch, focus_controls, following_controls, freecam_controls,
-    gimbal_controls, gimbal_pid_controls, projectile_aerodynamics, projectile_launch,
-    remote_gimbal_controls, remote_vehicle_controls, sample_gamepad_controller,
-    sample_keyboard_controller, screenshot_on_f2, screenshot_saving, setup_projectile,
-    switch_slapper_control, uav_launch, update_auto_aim_subscription, update_camera_follow,
-    update_camera_follow_slapper, update_chassis_observation, vehicle_controls,
+    gimbal_controls, gimbal_pid_controls, inset_controls, projectile_aerodynamics,
+    projectile_launch, remote_gimbal_controls, remote_vehicle_controls, sample_gamepad_controller,
+    sample_keyboard_controller, screenshot_on_f2, screenshot_saving, setup_picture_in_picture,
+    setup_projectile, switch_slapper_control, uav_launch, update_auto_aim_subscription,
+    update_camera_follow, update_camera_follow_slapper, update_chassis_observation,
+    update_picture_in_picture, vehicle_controls,
 };
 use bevy_metalfx::MetalFxPlugin;
 
@@ -147,6 +149,7 @@ fn main() {
         .add_plugins(ConfigPlugin)
         .init_resource::<CameraMode>()
         .init_resource::<CameraFocus>()
+        .init_resource::<PictureInPictureState>()
         .init_resource::<ProjectileStatistics>()
         .init_resource::<ChassisObservationFrame>()
         .init_resource::<PreviousKinematicState>()
@@ -160,7 +163,7 @@ fn main() {
             config.projectile.cooldown,
             TimerMode::Once,
         )))
-        .add_systems(Startup, (setup, setup_projectile))
+        .add_systems(Startup, (setup, setup_projectile, setup_picture_in_picture))
         .add_observer(on_hit)
         .add_observer(on_activate)
         .configure_sets(
@@ -184,6 +187,7 @@ fn main() {
                     update_auto_aim_subscription,
                     following_controls,
                     focus_controls,
+                    inset_controls,
                     switch_slapper_control,
                     vehicle_controls.run_if(|mode: Res<CameraMode>| mode.0 != FollowingType::Free),
                     remote_vehicle_controls,
@@ -206,6 +210,7 @@ fn main() {
                     update_camera_follow_slapper
                         .run_if(|mode: Res<CameraMode>| mode.0 != FollowingType::Free)
                         .run_if(|focus: Res<CameraFocus>| *focus == CameraFocus::Slapper),
+                    update_picture_in_picture,
                 )
                     .in_set(GameplaySystems::Camera)
                     .before(RenderSystems::Render),

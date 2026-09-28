@@ -255,11 +255,41 @@ impl Default for ProjectileAerodynamicsConfig {
 }
 
 #[derive(Deserialize, Reflect, Clone)]
+#[serde(default)]
 pub struct CameraConfig {
     pub fov: f32,
     pub free_move_speed: f32,
     pub follow_offset: [f32; 3],
     pub mouse_sensitivity: f32,
+    /// Third-person inset shown while the main view is first-person.
+    pub pip_enabled: bool,
+    /// Inset render target size in pixels as `[width, height]` (needs a restart).
+    pub pip_size: [f32; 2],
+    /// Distance from the bottom-right corner in pixels.
+    pub pip_margin: f32,
+    /// Inset opacity, `0.0..=1.0`.
+    pub pip_opacity: f32,
+    /// Render the inset every N frames (`1` = every frame).
+    pub pip_refresh_divisor: u32,
+    /// Far plane of the inset camera in meters; culls distant scenery.
+    pub pip_far: f32,
+}
+
+impl Default for CameraConfig {
+    fn default() -> Self {
+        Self {
+            fov: 45.0,
+            free_move_speed: 8.0,
+            follow_offset: [0.0, 3.0, 2.0],
+            mouse_sensitivity: 0.003,
+            pip_enabled: true,
+            pip_size: [320.0, 180.0],
+            pip_margin: 16.0,
+            pip_opacity: 0.8,
+            pip_refresh_divisor: 2,
+            pip_far: 60.0,
+        }
+    }
 }
 
 #[derive(Deserialize, Reflect, Clone)]
@@ -373,12 +403,7 @@ impl Default for SimulationConfig {
                     uav_size: 1.0,
                     uav_vel: 2.0,
                 },
-                camera: CameraConfig {
-                    fov: 45.0,
-                    free_move_speed: 8.0,
-                    follow_offset: [0.0, 3.0, 2.0],
-                    mouse_sensitivity: 0.003,
-                },
+                camera: CameraConfig::default(),
             }
         })
     }
@@ -461,5 +486,38 @@ fn config_hot_reload(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_section_tolerates_missing_fields() {
+        let camera: CameraConfig =
+            toml::from_str("fov = 30.0\n").expect("partial [camera] section");
+
+        assert_eq!(camera.fov, 30.0);
+        assert_eq!(camera.pip_opacity, 0.8);
+        assert!(camera.pip_enabled);
+        assert_eq!(camera.pip_refresh_divisor, 2);
+    }
+
+    #[test]
+    fn inset_defaults_keep_the_extra_pass_cheap() {
+        let camera = CameraConfig::default();
+
+        assert_eq!(camera.pip_size, [320.0, 180.0]);
+        assert_eq!(camera.pip_refresh_divisor, 2, "每 2 帧渲染一次，减半开销");
+        assert_eq!(camera.pip_far, 60.0);
+    }
+
+    #[test]
+    fn repository_config_parses() {
+        let config = SimulationConfig::load().expect("config.toml 必须能解析");
+
+        assert!(config.camera.pip_refresh_divisor >= 1);
+        assert!(config.camera.pip_far > 0.0);
     }
 }

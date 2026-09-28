@@ -1,13 +1,19 @@
+use bevy::camera::RenderTarget;
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::input::mouse::MouseMotion;
 use bevy::prelude::*;
+use bevy::render::render_resource::TextureFormat;
 use std::f32::consts::PI;
 
 use crate::components::{
     ActiveSlapper, CameraFocus, CameraMode, Controlled, FollowingType, Infantry, InfantryGimbal,
-    InfantryLaunchOffset, InfantryViewOffset, MainCamera,
+    InfantryLaunchOffset, InfantryViewOffset, MainCamera, PictureInPicture, PictureInPictureNode,
+    PictureInPictureState,
 };
-use crate::config::SimulationConfig;
+use crate::config::{CameraConfig, SimulationConfig};
 use crate::systems::ControllerState;
+
+const INSET_BORDER_COLOR: Color = Color::srgba(1.0, 1.0, 1.0, 0.35);
 
 pub fn following_controls(mut mode: ResMut<CameraMode>, controller: Res<ControllerState>) {
     if controller.controlled.switch_camera_just_pressed {
@@ -22,6 +28,12 @@ pub fn following_controls(mut mode: ResMut<CameraMode>, controller: Res<Controll
 pub fn focus_controls(controller: Res<ControllerState>, mut focus: ResMut<CameraFocus>) {
     if controller.controlled.switch_focus_just_pressed {
         focus.toggle();
+    }
+}
+
+pub fn inset_controls(controller: Res<ControllerState>, mut inset: ResMut<PictureInPictureState>) {
+    if controller.controlled.toggle_inset_just_pressed {
+        inset.toggle();
     }
 }
 
@@ -106,6 +118,137 @@ pub fn update_camera_follow_slapper(
         view_offset,
         launch_offset,
     );
+}
+
+/// Off-screen third-person camera for the first-person inset, plus the UI node
+/// that shows its render target. Only the render target size is fixed for the
+/// session; visibility, margin and opacity stay live.
+pub fn setup_picture_in_picture(
+    mut commands: Commands,
+    config: Res<SimulationConfig>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let size = inset_size(&config.camera);
+    let target = images.add(Image::new_target_texture(
+        size.x,
+        size.y,
+        TextureFormat::Bgra8UnormSrgb,
+        Some(TextureFormat::Bgra8UnormSrgb),
+    ));
+
+    commands.spawn((
+        Camera3d::default(),
+        Camera {
+            order: 2,
+            is_active: false,
+            ..default()
+        },
+        RenderTarget::Image(target.clone().into()),
+        Projection::Perspective(PerspectiveProjection {
+            fov: config.camera.fov.to_radians(),
+            far: config.camera.pip_far.max(1.0),
+            ..default()
+        }),
+        Tonemapping::None,
+        Msaa::Off,
+        Transform::from_xyz(0.0, 3.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
+        PictureInPicture::new(Vec3::from_array(config.camera.follow_offset)),
+    ));
+
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(config.camera.pip_margin),
+            bottom: Val::Px(config.camera.pip_margin),
+            width: Val::Px(size.x as f32),
+            height: Val::Px(size.y as f32),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(6.0)),
+            ..default()
+        },
+        BorderColor::all(INSET_BORDER_COLOR),
+        ImageNode {
+            image: target,
+            color: inset_tint(&config.camera),
+            ..default()
+        },
+        PictureInPictureNode,
+    ));
+}
+
+fn inset_size(camera: &CameraConfig) -> UVec2 {
+    UVec2::new(
+        camera.pip_size[0].max(1.0) as u32,
+        camera.pip_size[1].max(1.0) as u32,
+    )
+}
+
+fn inset_tint(camera: &CameraConfig) -> Color {
+    Color::srgba(1.0, 1.0, 1.0, camera.pip_opacity.clamp(0.0, 1.0))
+}
+
+/// Shows the inset only while the main view is first-person and follows the same
+/// robot as the main camera (own robot, or the active slapper). The inset pass is
+/// skipped on frames outside `pip_refresh_divisor` so it only costs a fraction of
+/// a second scene render.
+pub fn update_picture_in_picture(
+    config: Res<SimulationConfig>,
+    mode: Res<CameraMode>,
+    focus: Res<CameraFocus>,
+    state: Res<PictureInPictureState>,
+    camera: Single<(&mut PictureInPicture, &mut Transform, &mut Camera), With<PictureInPicture>>,
+    roots: Query<
+        (&Transform, Option<&Controlled>, Option<&ActiveSlapper>),
+        (With<Infantry>, Without<PictureInPicture>),
+    >,
+    inset: Single<(&mut Node, &mut ImageNode), With<PictureInPictureNode>>,
+) {
+    let (mut pip, mut camera_transform, mut camera) = camera.into_inner();
+    let (mut node, mut image) = inset.into_inner();
+
+    let visible = state.enabled && config.camera.pip_enabled && mode.0 == FollowingType::Robot;
+    let render = pip.tick(visible, config.camera.pip_refresh_divisor);
+
+    let display = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if node.display != display {
+        node.display = display;
+    }
+    if camera.is_active != render {
+        camera.is_active = render;
+    }
+
+    let margin = Val::Px(config.camera.pip_margin);
+    if node.right != margin {
+        node.right = margin;
+    }
+    if node.bottom != margin {
+        node.bottom = margin;
+    }
+
+    let tint = inset_tint(&config.camera);
+    if image.color != tint {
+        image.color = tint;
+    }
+
+    if !render {
+        return;
+    }
+
+    let target = roots.iter().find(|(_, controlled, active)| match *focus {
+        CameraFocus::Own => controlled.is_some(),
+        CameraFocus::Slapper => active.is_some(),
+    });
+    let Some((root, _, _)) = target else {
+        return;
+    };
+
+    let offset = root.rotation * pip.follow_offset;
+    camera_transform.translation = root.translation + offset;
+    camera_transform.look_at(root.translation, Vec3::Y);
 }
 
 pub fn freecam_controls(
@@ -231,5 +374,29 @@ mod tests {
         );
 
         assert_eq!(camera.translation, Vec3::new(9.0, 9.0, 9.0));
+    }
+
+    #[test]
+    fn inset_defaults_to_eighty_percent_opacity() {
+        let camera = CameraConfig::default();
+
+        assert_eq!(inset_size(&camera), UVec2::new(320, 180));
+        assert_eq!(
+            inset_tint(&camera),
+            Color::srgba(1.0, 1.0, 1.0, 0.8),
+            "an inset alpha of 0.8 means 20% see-through"
+        );
+    }
+
+    #[test]
+    fn inset_size_and_opacity_are_clamped() {
+        let oversized = CameraConfig {
+            pip_size: [0.0, -8.0],
+            pip_opacity: 2.0,
+            ..CameraConfig::default()
+        };
+
+        assert_eq!(inset_size(&oversized), UVec2::new(1, 1));
+        assert_eq!(inset_tint(&oversized), Color::srgba(1.0, 1.0, 1.0, 1.0));
     }
 }

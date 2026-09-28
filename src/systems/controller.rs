@@ -92,6 +92,7 @@ pub struct ControllerInput {
     pub switch_slapper_just_pressed: bool,
     pub switch_camera_just_pressed: bool,
     pub switch_focus_just_pressed: bool,
+    pub toggle_inset_just_pressed: bool,
     pub auto_aim: bool,
 }
 
@@ -110,6 +111,7 @@ impl Default for ControllerInput {
             switch_slapper_just_pressed: false,
             switch_camera_just_pressed: false,
             switch_focus_just_pressed: false,
+            toggle_inset_just_pressed: false,
             auto_aim: false,
         }
     }
@@ -245,6 +247,7 @@ pub fn sample_keyboard_controller(
     controlled.switch_slapper_just_pressed |= keyboard.just_pressed(KeyCode::Tab);
     controlled.switch_camera_just_pressed |= keyboard.just_pressed(KeyCode::F3);
     controlled.switch_focus_just_pressed |= keyboard.just_pressed(KeyCode::KeyO);
+    controlled.toggle_inset_just_pressed |= keyboard.just_pressed(KeyCode::F6);
 
     let remote_chassis_yaw = controller.remote_chassis_spin.yaw_input();
     let remote = &mut controller.remote;
@@ -339,6 +342,7 @@ pub fn sample_gamepad_controller(
     controlled.switch_slapper_just_pressed |= gamepad.just_pressed(GamepadButton::Start);
     controlled.switch_camera_just_pressed |= gamepad.just_pressed(GamepadButton::Select);
     controlled.switch_focus_just_pressed |= gamepad.just_pressed(GamepadButton::South);
+    controlled.toggle_inset_just_pressed |= gamepad.just_pressed(GamepadButton::East);
 
     let remote = &mut controller.remote;
     remote.add_movement(-dpad);
@@ -454,11 +458,12 @@ fn keyboard_controller_active(keyboard: &ButtonInput<KeyCode>) -> bool {
         KeyCode::KeyF,
         KeyCode::KeyV,
     ];
-    const EDGE_KEYS: [KeyCode; 7] = [
+    const EDGE_KEYS: [KeyCode; 8] = [
         KeyCode::KeyG,
         KeyCode::Tab,
         KeyCode::F3,
         KeyCode::F5,
+        KeyCode::F6,
         KeyCode::KeyQ,
         KeyCode::KeyU,
         KeyCode::KeyO,
@@ -486,6 +491,7 @@ fn gamepad_controller_active(
         || gamepad.just_pressed(GamepadButton::North)
         || gamepad.just_pressed(GamepadButton::West)
         || gamepad.just_pressed(GamepadButton::South)
+        || gamepad.just_pressed(GamepadButton::East)
         || gamepad.just_pressed(GamepadButton::Start)
         || gamepad.just_pressed(GamepadButton::Select)
 }

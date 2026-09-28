@@ -6,6 +6,61 @@ pub struct MainCamera {
     pub follow_offset: Vec3,
 }
 
+/// Off-screen camera rendering the third-person inset.
+#[derive(Component)]
+pub struct PictureInPicture {
+    /// Third-person offset in the robot's local space, captured at startup.
+    pub follow_offset: Vec3,
+    frame: u64,
+    was_visible: bool,
+}
+
+impl PictureInPicture {
+    pub fn new(follow_offset: Vec3) -> Self {
+        Self {
+            follow_offset,
+            frame: 0,
+            was_visible: false,
+        }
+    }
+
+    /// Advances the inset clock and reports whether the extra pass runs this
+    /// frame. Rendering every `divisor` frames halves the cost of a second view;
+    /// a freshly shown inset renders immediately so it never appears stale.
+    pub fn tick(&mut self, visible: bool, divisor: u32) -> bool {
+        let divisor = divisor.max(1) as u64;
+        let render =
+            visible && (divisor == 1 || self.frame.is_multiple_of(divisor) || !self.was_visible);
+
+        self.frame = self.frame.wrapping_add(1);
+        self.was_visible = visible;
+        render
+    }
+}
+
+/// UI node showing the `PictureInPicture` camera's render target.
+#[derive(Component)]
+pub struct PictureInPictureNode;
+
+/// Runtime on/off for the inset (`F6` / gamepad `B`). `camera.pip_enabled` in
+/// `config.toml` stays the master switch.
+#[derive(Resource, Debug)]
+pub struct PictureInPictureState {
+    pub enabled: bool,
+}
+
+impl Default for PictureInPictureState {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl PictureInPictureState {
+    pub fn toggle(&mut self) {
+        self.enabled = !self.enabled;
+    }
+}
+
 #[derive(Resource, PartialEq, Deref, DerefMut)]
 pub struct CameraMode(pub FollowingType);
 
@@ -66,5 +121,45 @@ mod tests {
 
         focus.toggle();
         assert_eq!(focus, CameraFocus::Own);
+    }
+
+    #[test]
+    fn inset_tick_renders_every_divisor_frames_and_immediately_when_shown() {
+        let mut inset = PictureInPicture::new(Vec3::ZERO);
+
+        // Hidden: the extra pass never runs.
+        assert!(!inset.tick(false, 2));
+        assert!(!inset.tick(false, 2));
+
+        // Freshly shown: renders at once, whatever the frame phase is.
+        assert!(
+            inset.tick(true, 2),
+            "first visible frame renders immediately"
+        );
+
+        // Afterwards exactly one of any two consecutive frames renders.
+        let first = inset.tick(true, 2);
+        let second = inset.tick(true, 2);
+        assert!(first ^ second, "divisor 2 renders one frame out of two");
+
+        // Hiding stops the pass, showing again renders immediately.
+        assert!(!inset.tick(false, 2));
+        assert!(inset.tick(true, 2));
+
+        // A divisor of one renders every frame; zero means "every frame".
+        assert!(inset.tick(true, 1));
+        assert!(inset.tick(true, 0));
+    }
+
+    #[test]
+    fn inset_starts_enabled_and_toggles() {
+        let mut inset = PictureInPictureState::default();
+        assert!(inset.enabled);
+
+        inset.toggle();
+        assert!(!inset.enabled);
+
+        inset.toggle();
+        assert!(inset.enabled);
     }
 }

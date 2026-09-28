@@ -104,5 +104,16 @@ wind = [0.0, 0.0, 0.0]          # m/s - wind velocity in world coordinates
 [camera]
 fov = 45.0                      # degrees - field of view
 free_move_speed = 8.0           # m/s - free camera movement speed
-follow_offset = [0.0, 3.0, 2.0] # follow camera offset
+follow_offset = [0.0, 3.0, 2.0] # follow camera offset (also used by the inset)
 mouse_sensitivity = 0.003       # mouse look sensitivity
+
+# Third-person inset in the bottom-right corner, shown while the main view is
+# first-person. `F6` (gamepad B) toggles it at runtime; `pip_enabled` is the
+# master switch. It costs one extra scene render while visible, so it refreshes
+# every `pip_refresh_divisor` frames and culls beyond `pip_far`.
+pip_enabled = true              # master switch for the inset
+pip_size = [320.0, 180.0]       # px - inset render target size (restart required)
+pip_margin = 16.0               # px - distance from the bottom-right corner
+pip_opacity = 0.8               # 0.0..=1.0 - inset opacity
+pip_refresh_divisor = 2         # render the inset every N frames (1 = every frame)
+pip_far = 60.0                  # m - inset camera far plane (culls distant scenery)
