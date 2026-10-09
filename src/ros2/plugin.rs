@@ -188,6 +188,27 @@ fn capture_rune(
         rot.2.to_degrees()
     );
 
+    // The `*CENTER` child is NOT present in every armor asset. GROUND.glb
+    // (`_ARMOR_CENTER`), HERO.glb (`1__L_ARMOR_CENTER`) and vehicle.glb
+    // (`*_ARMOR_CENTER`) have one, but OUTPOST.glb's `A..F_ARMOR_ROOT` and
+    // `AT|BT_ARMOR_ROOT` have no `*_CENTER` node at all — their children are
+    // `*_ARMOR`, `*_ARMOR_BASE`, `*_ARMOR_C`, `*_ARMOR_MARKER`, ... Unconditionally
+    // unwrapping the hierarchy lookup therefore crashed the whole simulator with
+    // `called Option::unwrap() on a None value` in `capture_rune` as soon as an
+    // outpost was loaded in a ROS2 build. (`ros2` is the only feature that registers
+    // `capture_rune`, which is why a `default`/`talos` build never hit it.)
+    // Fall back to the armor root's own global transform — that is exactly what the
+    // otherwise-unused `GlobalTransform` in the `armor` query is there for.
+    let armor_center = |entity: Entity, fallback: &GlobalTransform| -> Transform {
+        qq.of(entity)
+            .suffix("CENTER")
+            .any()
+            .one()
+            .and_then(|center_entity| center.get(center_entity).ok())
+            .map(|(_, center_tf)| center_tf.compute_transform())
+            .unwrap_or_else(|| fallback.compute_transform())
+    };
+
     let transform_stamped = tf_tree! {
         stamp: Clock::to_builtin_time(&res_unwrap!(clock).get_now().unwrap());
 
@@ -211,24 +232,20 @@ fn capture_rune(
                     pub name as (tf.translation, tf.rotation);
                 }
             }
-            for (entity, _transform, armor) in armor {
+            for (entity, armor_tf, armor) in armor {
                 let name = format!("armor_{:?}", armor.id.as_usize())
                     .to_string()
                     .to_lowercase();
-                let tf = center.get(qq.of(entity).suffix("CENTER").any().one().unwrap()).unwrap().1.compute_transform();
+                let tf = armor_center(entity, armor_tf);
                 pub name as (tf.translation, tf.rotation);
             }
         }
     };
 
     let stamp = Clock::to_builtin_time(&res_unwrap!(clock).get_now().unwrap());
-    for (entity, tf, armor) in armor {
-        let mut tff = center
-            .get(qq.of(entity).suffix("CENTER").any().one().unwrap())
-            .unwrap()
-            .1
-            .compute_transform();
-        tff.rotation = tf.rotation() * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, -PI / 2.0);
+    for (entity, armor_root_tf, armor) in armor {
+        let mut tff = armor_center(entity, armor_root_tf);
+        tff.rotation = armor_root_tf.rotation() * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, -PI / 2.0);
         let tf = transform(tff);
         marker_pub.publish(Marker {
             header: Header {
