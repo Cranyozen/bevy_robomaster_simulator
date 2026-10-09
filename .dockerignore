@@ -1,0 +1,89 @@
+# .dockerignore — keep the build context small (target/ alone is >13 GB on disk).
+#
+# IMPORTANT: this file must NOT exclude anything the Dockerfile actually copies:
+#   Cargo.toml, Cargo.lock, crates/, third_party/, src/, assets/, config.toml,
+#   rm_interfaces/, README.md (used for a smoke `--help`/docs stage).
+
+# ---- Cargo build output (the big one) ----
+target/
+**/target/
+/target
+**/*.rlib
+**/*.rmeta
+**/*.d
+**/*.pdb
+
+# ---- VCS / editor ----
+.git/
+.gitignore
+.githooks/
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# ---- Screenshots / generated media in the repo root ----
+screenshot-*.png
+screenshot*.png
+demo.png
+
+# ---- Colcon / ament build artifacts (never ship host-built ones) ----
+/install/
+/log/
+/build/
+**/install/
+**/log/
+**/build/
+
+# ---- Datasets and captures ----
+/dataset/
+dataset/
+*.bag
+*.db3
+*.mcap
+*.pcd
+*.ply
+*.blend
+*.blend1
+assets_old/
+assets/*.blend
+assets/*.blend1
+
+# ---- Local env / scripts that may contain secrets ----
+env.sh
+build.sh
+.env
+.env.*
+
+# ---- Local probe / scratch dirs used during Dockerfile development ----
+.tmp-probe/
+.docker-probe/
+
+# ---- Archives / misc ----
+*.stp
+*.tar
+*.tar.gz
+*.zip
+
+# ---- Docs we do not ship (README is explicitly kept) ----
+*.md
+!README.md
+LICENSE
+dupast.toml
+
+# ---- But be explicit: these MUST stay in the context ----
+!assets/
+!assets/**
+!rm_interfaces/
+!rm_interfaces/**
+!crates/
+!crates/**
+!third_party/
+!third_party/**
+!src/
+!src/**
+!config.toml
+!Cargo.toml
+!Cargo.lock
+!clippy.toml

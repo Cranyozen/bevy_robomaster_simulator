@@ -1,0 +1,138 @@
+# docker compose for Daedalus (bevy_robomaster_simulator)
+#
+#   docker compose build daedalus          # primary verification (no GPU needed)
+#   docker compose run --rm daedalus sanity
+#   docker compose up daedalus             # needs a GPU + display (see below)
+#
+# The build must succeed on a headless host.  *Running* the simulator needs a
+# Vulkan GPU and a display; the `daedalus` service below already carries the
+# Intel/AMD passthrough, which is the configuration that was actually verified
+# (AMD Radeon 780M / RADV + a Wayland KWin session). NVIDIA and software-rendering
+# alternatives are documented right below it.
+
+#   docker compose run --rm daedalus              # headless linkage/ROS check
+#   docker compose run --rm daedalus /app/daedalus  # open the simulator window
+
+name: daedalus
+
+services:
+  # ---------------------------------------------------------------------------
+  # Primary service: ROS 2 Jazzy + r2r + talos, full feature build.
+  # ---------------------------------------------------------------------------
+  daedalus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        # Default features are ["talos"]; `--features ros2` is ADDITIVE, so this
+        # yields talos + ros2 (the primary target).
+        CARGO_FEATURES: "ros2"
+        ROS_DISTRO: "jazzy"
+      # BuildKit cache mounts keep re-builds fast; the Cargo layer cache in the
+      # Dockerfile does most of the work, these help additionally.
+      cache_from:
+        - type=local,src=.docker-cache
+      cache_to:
+        - type=local,dest=.docker-cache,mode=max
+    image: daedalus:latest
+    # `sanity` = headless linkage/ROS check; override with `bash` for a shell.
+    command: ["sanity"]
+    # Network: ROS 2 DDS needs host networking for discovery across containers.
+    network_mode: host
+    ipc: host
+    init: true
+    environment:
+      ROS_DOMAIN_ID: "0"
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      RUST_LOG: info
+      # /app/lib holds libbevy_dylib-<hash>.so + libstd-<hash>.so
+      LD_LIBRARY_PATH: /app/lib:/ros2_ws/install/lib:/opt/ros/jazzy/lib
+      # --- display (see the passthrough block below) -------------------------
+      # The image already sets DISPLAY=:0 / WAYLAND_DISPLAY=wayland-0 but points
+      # XDG_RUNTIME_DIR at /tmp/runtime-root, which does not hold the host's
+      # Wayland socket. Overriding it to the host dir is what actually works.
+      DISPLAY: ${DISPLAY:-:0}
+      WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-wayland-0}
+      XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-/run/user/1000}
+      LIBGL_ALWAYS_SOFTWARE: "0"
+    volumes:
+      # Hot-reloadable simulation config (watched by notify in src/config.rs)
+      - ./config.toml:/app/config.toml:ro
+      # Uncomment to iterate on assets without rebuilding the image:
+      # - ./assets:/app/assets:ro
+      # --- display sockets (see the passthrough block below) -----------------
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Only the Wayland socket is needed; mounting the whole XDG_RUNTIME_DIR
+      # would also expose the session bus and other users' sockets.
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/wayland-0:${XDG_RUNTIME_DIR:-/run/user/1000}/wayland-0
+
+    # ------------------------- GPU / DISPLAY PASSTHROUGH ---------------------
+    # (a) Intel / AMD — Mesa + /dev/dri. THIS IS THE ACTIVE, VERIFIED ONE.
+    # The runtime image already ships mesa-vulkan-drivers (radeon_icd.json +
+    # libvulkan_radeon.so) and the Wayland/X11 client libraries, so only the
+    # device nodes and sockets have to be handed over. With this the container
+    # renders on the real GPU:
+    #   AdapterInfo { name: "AMD Radeon 780M Graphics (RADV PHOENIX)", backend: Vulkan }
+    devices:
+      - /dev/dri:/dev/dri
+    # Only needed if the image is run as a non-root user; /dev/dri/renderD128 is
+    # usually 0666, but /dev/dri/card0|1 are root:video 0660.
+    group_add:
+      - video
+      - render
+    #
+    # (b) NVIDIA — nvidia-container-toolkit required
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu, graphics, display, compute, utility, video]
+    #
+    # (c) NO GPU (software rendering via mesa lavapipe — slow but boots).
+    # NOTE: on Ubuntu 24.04 noble the lavapipe ICD file is `lvp_icd.json`
+    # (NO architecture suffix). VK_ICD_FILENAMES is a hard override, so only set
+    # it here — leaving it unset is what lets a real GPU driver be found.
+    # environment:
+    #   VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+    #   LIBGL_ALWAYS_SOFTWARE: "1"
+
+  # ---------------------------------------------------------------------------
+  # Lean variant: default features only (talos), no r2r/ros2 compile.
+  # Fallback target if the r2r/bindgen path is ever broken.
+  #   docker compose -f docker-compose.yml build daedalus-lean
+  # ---------------------------------------------------------------------------
+  daedalus-lean:
+    profiles: ["lean"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-lean
+      args:
+        CARGO_FEATURES: "talos"
+        ROS_DISTRO: "jazzy"
+    image: daedalus:lean
+    command: ["sanity"]
+
+  # ---------------------------------------------------------------------------
+  # The container image is where the ROS 2 nodes live; a second image is not
+  # needed. To talk to a robot running real ROS 2 on the LAN, start this service
+  # (network_mode: host above) and set ROS_DOMAIN_ID to match the robot.
+  # For purely local two-container tests:
+  # ---------------------------------------------------------------------------
+  ros2-talker:
+    profiles: ["ros"]
+    image: ros:jazzy
+    network_mode: host
+    ipc: host
+    environment:
+      ROS_DOMAIN_ID: "0"
+    command:
+      - bash
+      - -lc
+      - |
+        . /opt/ros/jazzy/setup.bash
+        ros2 topic list
+        ros2 topic echo /rm_gimbal/cmd
