@@ -23,6 +23,13 @@ target/
 *~
 .DS_Store
 
+# ---- Local agent notes / evidence captures ----
+# The Dockerfile never copies this, and it changes far more often than the
+# source does — leaving it in the context would bust the builder's `COPY . .`
+# layer and force a full recompile of the daedalus crate for a note edit.
+.agents/
+.agents
+
 # ---- Screenshots / generated media in the repo root ----
 screenshot-*.png
 screenshot*.png
