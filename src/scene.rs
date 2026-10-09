@@ -175,11 +175,28 @@ async fn load_scene(w: AsyncWorld) {
     colliders_ready(&w, power_rune).await;
 
     // Robots last, so they can never become dynamic over an empty world.
+    //
+    // Player start pose, tuned for the ROS 2 auto-aim loop: from here two enemy
+    // robots (armour numbers "1" and "3") sit ~1.8-2.0 m ahead and square in the
+    // camera, so `armor_detector` sees them immediately without anyone having to
+    // drive anywhere first.
+    //
+    // Captured from a live session rather than guessed: the world pose
+    // (gimbal translation + gimbal/camera +Z) was read off `/tf`, and the chassis
+    // pose solved from it using the gimbal mount offset measured at the previous
+    // spawn. Position is Bevy world (y up); the rotation is a quaternion on
+    // purpose — the chassis there is pitched, so Euler angles would have to be
+    // re-derived against Bevy's rotation order.
     let player = w
         .spawn(
             scene("vehicle.glb"),
             (
-                Transform::from_xyz(0.0, 1.0, 0.0),
+                Transform::from_xyz(0.1433, 0.4199, 3.1117).with_rotation(Quat::from_xyzw(
+                    -0.26040781,
+                    -0.21265314,
+                    -0.05930884,
+                    0.93991959,
+                )),
                 Infantry::new(Team::Red, INFANTRY_THREE_CONFIG),
                 Controlled,
             ),
