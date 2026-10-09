@@ -256,6 +256,125 @@
 
 ---
 
+## 🐳 Docker 运行
+
+镜像基于 **ROS 2 Jazzy**（Ubuntu 24.04 noble）多阶段构建，默认打开 `talos` + `ros2`（r2r）特性。
+
+| 文件                 | 说明                                                                     |
+|--------------------|------------------------------------------------------------------------|
+| `Dockerfile`       | 多阶段：`deps`（系统依赖）→ `chef`（依赖缓存预编译）→ `builder`（真实编译）→ `runtime`（运行时） |
+| `.dockerignore`    | 排除 13 GB 的 `target/` 与 `.git`，构建上下文压到约 100 MB（其中约 92 MB 是必需的 `assets/`） |
+| `docker-compose.yml` | 常用编排；`daedalus` 服务已带上实测过的 AMD 核显 + Wayland/X11 直通            |
+| `docker/`          | 入口脚本、`sanity` 自检、ROS 环境与 IDL 包辅助脚本                                   |
+
+### 构建
+
+```bash
+# ros2 + talos（默认特性组合）
+docker build -t daedalus:latest .
+
+# 只编译默认的 talos 特性（不涉及 r2r/bindgen，最快的可用组合）
+docker build --target runtime-lean --build-arg CARGO_FEATURES=talos -t daedalus:lean .
+
+# 额外打开 ffmpeg（talos_gimbal_mock_server 需要 talos + ffmpeg）
+docker build --build-arg CARGO_FEATURES='ros2 ffmpeg' -t daedalus:ffmpeg .
+```
+
+> `--features ros2` 是**叠加**的：默认特性 `talos` 仍然生效，所以 `CARGO_FEATURES=ros2` 得到的是 talos + ros2。
+> 构建过程会把 `rm_interfaces/`（仓库自带的 ament 包，不在 `ros:jazzy` 基础镜像里）用 colcon 编译并 source，
+> 否则 r2r 生成不出 `r2r::rm_interfaces::msg::GimbalCmd`。
+
+### 运行前的自检
+
+不需要显卡，可在任意机器上确认镜像可用性（动态库解析 + ROS 环境 + Vulkan ICD）：
+
+```bash
+docker run --rm daedalus:latest sanity
+```
+
+`sanity` 会检查 `ldd` 是否有 `not found`、`rm_interfaces/msg/GimbalCmd` 是否可见。
+构建时也已内置同样的 `ldd` 门禁：动态库解析不了会直接构建失败。
+
+### 运行模拟器
+
+运行需要 **Vulkan GPU** 和一块显示器（容器与宿主机共用内核，Docker 无法凭空提供显卡）。
+下面的 Intel / AMD 命令已实测通过：容器内拿到的是真实核显，窗口正常出现。
+
+```bash
+docker run --rm -it \
+  --device /dev/dri:/dev/dri \
+  --group-add video --group-add render \
+  -e DISPLAY="$DISPLAY" \
+  -e WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+  -e XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" \
+  --network host \
+  daedalus:latest
+```
+
+> `XDG_RUNTIME_DIR` 必须覆盖成**宿主机**的值：镜像里默认是 `/tmp/runtime-root`，那里没有宿主机的
+> Wayland socket。只挂载 `wayland-0` 这一个 socket 就够了，不必把整个 `$XDG_RUNTIME_DIR` 挂进去。
+> 启动日志出现 `AdapterInfo { name: "… (RADV …)", backend: Vulkan }` 说明走的是真显卡；
+> 若显示 `llvmpipe` 则说明退回了软件渲染。
+
+`/dev/dri` 是否存在取决于**宿主机**，容器内看不到设备通常不是 Docker 的问题，而是设备节点本身
+不存在、当前用户不在 `video`/`render` 组，或调用方被沙箱挡住了 `ls /dev/dri`。先确认：
+
+```bash
+ls -l /dev/dri/            # 应能看到 card*/renderD*
+vulkaninfo --summary | grep -E 'deviceName|driverName'
+```
+
+NVIDIA 需要 `nvidia-container-toolkit`，把上面的 `--device /dev/dri` 换成 `--gpus all`（或在 compose 里用
+`deploy.resources.reservations.devices` 的写法）。`docker-compose.yml` 里 (a) 段是已验证的 Intel/AMD 配置，
+(b)/(c) 是 NVIDIA 与纯软件渲染的模板。
+
+没有显卡时可以用 **Mesa lavapipe 软件渲染**兜底（能启动，帧率很低）：
+
+```bash
+docker run --rm -it --network host \
+  -e VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+  -e LIBGL_ALWAYS_SOFTWARE=1 \
+  daedalus:latest
+```
+
+> 注意 `VK_ICD_FILENAMES` 是**硬覆盖**而不是候选列表：只在确实没有显卡时才设置它，
+> 否则会把真实显卡驱动屏蔽掉。noble 上 lavapipe 的文件名是 `lvp_icd.json`（**没有** `.x86_64` 后缀）。
+
+### docker compose
+
+```bash
+docker compose build daedalus                    # 构建（无需显卡）
+docker compose run --rm daedalus sanity          # 无头自检
+docker compose run --rm daedalus /app/daedalus   # 开窗口（服务里已配好 GPU/显示直通）
+```
+
+> `daedalus` 服务的默认 `command` 是 `sanity`，所以 `docker compose up daedalus` 只会跑自检然后退出；
+> 要出界面得显式给命令，像上面第三行那样。
+
+`config.toml` 以只读方式挂载进容器，配合 `notify` 热重载可以直接改参数而不用重建镜像。
+
+### ROS2 模式下加载前哨站会崩溃（已修）
+
+`ros2` 特性会注册 `capture_rune`（`src/ros2/plugin.rs`），它为每个 `ArmorRoot` 发布 TF / Marker 时
+无条件取 `*CENTER` 子节点。但资产里只有 `GROUND.glb`（`_ARMOR_CENTER`）、`HERO.glb`
+（`1__L_ARMOR_CENTER`）和 `vehicle.glb` 有 `*_CENTER`，**`OUTPOST.glb` 的 `A..F_ARMOR_ROOT`
+根本没有**——于是窗口创建后约 1 秒就
+`panicked at src/ros2/plugin.rs: called Option::unwrap() on a None value`，退出码 101。
+
+`default`/`talos` 构建不注册这个系统，所以该缺陷只在 `CARGO_FEATURES=ros2` 的镜像里暴露。
+现在改为查不到时回退到装甲根节点自身的 `GlobalTransform`：缺一个可选的中心节点不该拖垮整个模拟器。
+
+### 关于动态链接
+
+Bevy 以 `dynamic_linking` 打开，最终二进制**不会**静态包含 Bevy，而是依赖带哈希后缀的
+`libbevy_dylib-<hash>.so`（以及 rustc 的 `libstd-<hash>.so`）。`Cargo.toml` 没有生成 rpath，
+所以 `runtime` 阶段会把这两个 `.so` 放进 `/app/lib` 并设置 `LD_LIBRARY_PATH`；
+它们的哈希与工具链相关，构建时用通配符从**同一个构建阶段**取出，不做硬编码。
+
+---
+
 ## 📝 项目信息
 
 * **作者**：Blackjack200

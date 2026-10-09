@@ -6,6 +6,8 @@ assets/*.blend
 assets/*.blend1
 .idea
 screenshot-*.png
+# Throwaway captures referenced from .agents/docker-changes-summary.md
+.agents/screenshots/
 /dataset/
 /install/
 /log/
