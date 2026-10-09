@@ -14,6 +14,7 @@ use crate::ros2::topic::*;
 use crate::systems::{GimbalAimTarget, GimbalAimTracker, projectile_launch};
 use crate::util::entity_query::HierarchyQuery;
 use bevy::ecs::system::RunSystemOnce;
+use bevy::image::BevyDefault;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use r2r::ClockType::SystemTime;

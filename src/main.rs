@@ -97,7 +97,7 @@ fn fixed_time_from_config(config: &SimulationConfig) -> Time<Fixed> {
 #[cfg(feature = "talos")]
 fn should_enable_talos_plugin(_app: &App) -> bool {
     #[cfg(feature = "ros2")]
-    let ros_capture_active = app
+    let ros_capture_active = _app
         .world()
         .contains_resource::<crate::ros2::capture::RosCaptureContext>();
     #[cfg(not(feature = "ros2"))]
