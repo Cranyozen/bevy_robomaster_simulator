@@ -37,15 +37,15 @@ use crate::robomaster::prelude::RoboMasterPlugins;
 use crate::setup::setup;
 use crate::statistic::ProjectileStatistics;
 use crate::systems::{
-    ChassisObservationFrame, ControllerState, GameplaySystems, HelpPlugin, PreviousKinematicState,
-    change_appearance, cleanup_projectiles, clear_controller_input, controller_dart_just_pressed,
-    controller_shoot_pressed, dart_launch, focus_controls, following_controls, freecam_controls,
-    gimbal_controls, gimbal_pid_controls, inset_controls, projectile_aerodynamics,
-    projectile_launch, remote_gimbal_controls, remote_vehicle_controls, sample_gamepad_controller,
-    sample_keyboard_controller, screenshot_on_f2, screenshot_saving, setup_picture_in_picture,
-    setup_projectile, switch_slapper_control, uav_launch, update_auto_aim_subscription,
-    update_camera_follow, update_camera_follow_slapper, update_chassis_observation,
-    update_picture_in_picture, vehicle_controls,
+    ChassisObservationFrame, ControllerState, GameplaySystems, HelpPlugin, PerformancePlugin,
+    PreviousKinematicState, change_appearance, cleanup_projectiles, clear_controller_input,
+    controller_dart_just_pressed, controller_shoot_pressed, dart_launch, focus_controls,
+    following_controls, freecam_controls, gimbal_controls, gimbal_pid_controls, inset_controls,
+    projectile_aerodynamics, projectile_launch, remote_gimbal_controls, remote_vehicle_controls,
+    sample_gamepad_controller, sample_keyboard_controller, screenshot_on_f2, screenshot_saving,
+    setup_picture_in_picture, setup_projectile, switch_slapper_control, uav_launch,
+    update_auto_aim_subscription, update_camera_follow, update_camera_follow_slapper,
+    update_chassis_observation, update_picture_in_picture, vehicle_controls,
 };
 use bevy_metalfx::MetalFxPlugin;
 
@@ -171,6 +171,7 @@ fn main() {
         .add_plugins(HelpPlugin)
         .add_plugins(crate::scene::ScenePlugin)
         .add_plugins(ConfigPlugin)
+        .add_plugins(PerformancePlugin)
         .init_resource::<CameraMode>()
         .init_resource::<CameraFocus>()
         .init_resource::<PictureInPictureState>()

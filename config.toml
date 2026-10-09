@@ -5,6 +5,18 @@
 # Options: auto_vsync, auto_no_vsync, fifo, fifo_relaxed, mailbox, immediate
 present_mode = "auto_no_vsync"
 
+[performance]
+# Frame rate cap for the main loop. 0 = uncapped (what Talos/ROS2 capture wants);
+# a positive value sleeps out the rest of each frame, so it only bites when
+# present_mode is not already vsync-limited. Clamped to 1..=1000.
+max_fps = 0.0
+# Upper bound on a single frame's delta, in seconds. 0 = engine default (0.25s).
+# This is the hitch guard: after a stall, gameplay sees at most this dt, and since
+# the fixed step is driven by virtual time it also caps the fixed steps one frame
+# may run (max_frame_delta * physics.fixed_hz), which is what keeps a slow frame
+# from snowballing into an ever-longer physics catch-up. Clamped to 0.001..=5.0.
+max_frame_delta = 0.0
+
 [debug]
 # Turn these on only when needed; they noticeably reduce FPS.
 egui = false
@@ -29,6 +41,17 @@ metalfx_frame_generation = false
 # Output/render resolution ratio used by MetalFX temporal upscaling. Clamped to 1.0..=3.0.
 metalfx_scale = 2.0
 illuminance = 500.0
+# Far plane of the main and capture cameras, in meters. 0 = built-in values
+# (main camera 5e8 m, capture camera 10 km). Setting e.g. 300 culls distant
+# scenery early and sharpens depth precision; the inset camera keeps its own
+# `camera.pip_far`, and the depth camera keeps `capture.depth.far`.
+view_distance = 0.0
+# Far bound of the shadow cascades, in meters. 0 = engine default (150 m).
+# Shrinking it is the cheapest way to make shadows affordable. Clamped to 1..=10000.
+shadow_max_distance = 0.0
+# Shadow cascade count, clamped to 1..=4. 0 = engine default (4).
+# Fewer cascades = fewer shadow passes, at the cost of blockier near shadows.
+shadow_cascades = 0
 [capture.color]
 # RGB capture resolution for existing camera pipeline.
 width = 1440

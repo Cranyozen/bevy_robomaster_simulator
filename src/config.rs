@@ -4,12 +4,15 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Resource, Deserialize, Reflect, Clone)]
 #[reflect(Resource)]
 pub struct SimulationConfig {
     #[serde(default)]
     pub window: WindowConfig,
+    #[serde(default)]
+    pub performance: PerformanceConfig,
     #[serde(default)]
     pub debug: DebugConfig,
     #[serde(default)]
@@ -39,6 +42,49 @@ impl Default for WindowConfig {
             // Uncap rendering by default so off-screen capture (Talos/ROS2) can exceed 60Hz.
             present_mode: "auto_no_vsync".to_string(),
         }
+    }
+}
+
+/// Load limits for the main loop itself, from `config.toml` → `[performance]`.
+///
+/// Both knobs default to `0.0`, i.e. "no limit", so a config file without this
+/// section behaves exactly like the engine defaults did.
+#[derive(Deserialize, Reflect, Clone, Default)]
+#[serde(default)]
+pub struct PerformanceConfig {
+    /// Upper bound on the main loop frame rate. `0` leaves the loop uncapped,
+    /// which is what off-screen Talos/ROS 2 capture wants; a positive value makes
+    /// the loop sleep out the rest of each frame (see `systems::performance`).
+    pub max_fps: f32,
+    /// Upper bound on a single frame's delta in seconds. `0` keeps the engine
+    /// default (0.25 s). This also bounds how many fixed steps one frame may run,
+    /// since those are driven by virtual time: `max_frame_delta * fixed_hz`.
+    pub max_frame_delta: f32,
+}
+
+/// The limiter sleeps in whole milliseconds, so sub-1 fps would just stall input,
+/// and above 1 kHz the OS timer cannot pace frames anyway.
+const MIN_MAX_FPS: f32 = 1.0;
+const MAX_MAX_FPS: f32 = 1000.0;
+/// The virtual-clock clamp has the same bounds, expressed as seconds.
+const MIN_FRAME_DELTA: f32 = 1.0 / MAX_MAX_FPS;
+const MAX_FRAME_DELTA: f32 = 5.0;
+
+impl PerformanceConfig {
+    /// Time one frame should take, or `None` when the loop stays uncapped.
+    pub fn frame_interval(&self) -> Option<Duration> {
+        (self.max_fps.is_finite() && self.max_fps > 0.0).then(|| {
+            Duration::from_secs_f64(1.0 / self.max_fps.clamp(MIN_MAX_FPS, MAX_MAX_FPS) as f64)
+        })
+    }
+
+    /// Clamp for the virtual clock, or `None` to keep the engine default.
+    pub fn frame_delta_cap(&self) -> Option<Duration> {
+        (self.max_frame_delta.is_finite() && self.max_frame_delta > 0.0).then(|| {
+            Duration::from_secs_f64(
+                self.max_frame_delta.clamp(MIN_FRAME_DELTA, MAX_FRAME_DELTA) as f64
+            )
+        })
     }
 }
 
@@ -83,6 +129,17 @@ pub struct RenderConfig {
     pub metalfx_frame_generation: bool,
     #[serde(alias = "main_camera_metalfx_scale")]
     pub metalfx_scale: f32,
+    /// Far plane of the main and capture cameras, in meters. `0` keeps the
+    /// built-in values (the main camera renders out to 5e8 m, the capture camera
+    /// to 10 km); a positive value culls early and sharpens depth precision.
+    pub view_distance: f32,
+    /// Far bound of the shadow cascades, in meters. `0` keeps the engine default
+    /// (150 m); a smaller value shrinks the shadow map area, which is the
+    /// cheapest way to make shadows affordable.
+    pub shadow_max_distance: f32,
+    /// Number of shadow cascades, clamped to `1..=4`. `0` keeps the engine
+    /// default (4). Fewer cascades means fewer shadow passes per light.
+    pub shadow_cascades: u32,
 }
 
 impl Default for RenderConfig {
@@ -94,6 +151,9 @@ impl Default for RenderConfig {
             metalfx_temporal: cfg!(target_os = "macos"),
             metalfx_frame_generation: false,
             metalfx_scale: 2.0,
+            view_distance: 0.0,
+            shadow_max_distance: 0.0,
+            shadow_cascades: 0,
         }
     }
 }
@@ -387,6 +447,7 @@ impl Default for SimulationConfig {
             warn!("Failed to load config.toml: {}, using defaults", e);
             Self {
                 window: WindowConfig::default(),
+                performance: PerformanceConfig::default(),
                 debug: DebugConfig::default(),
                 preview: PreviewConfig::default(),
                 render: RenderConfig::default(),
@@ -524,5 +585,52 @@ mod tests {
 
         assert!(config.camera.pip_refresh_divisor >= 1);
         assert!(config.camera.pip_far > 0.0);
+    }
+
+    #[test]
+    fn limit_sections_tolerate_missing_fields() {
+        let performance: PerformanceConfig =
+            toml::from_str("max_fps = 60.0\n").expect("partial [performance] section");
+        let render: RenderConfig =
+            toml::from_str("shadow_cascades = 2\n").expect("partial [render] section");
+
+        assert_eq!(performance.max_fps, 60.0);
+        assert_eq!(
+            performance.max_frame_delta, 0.0,
+            "an unset hitch guard stays off"
+        );
+        assert_eq!(render.shadow_cascades, 2);
+        assert_eq!(render.view_distance, 0.0);
+        assert_eq!(render.shadow_max_distance, 0.0);
+    }
+
+    #[test]
+    fn limits_default_to_no_limit() {
+        let performance = PerformanceConfig::default();
+        let render = RenderConfig::default();
+
+        assert_eq!(performance.max_fps, 0.0);
+        assert_eq!(performance.max_frame_delta, 0.0);
+        assert_eq!(render.view_distance, 0.0);
+        assert_eq!(render.shadow_max_distance, 0.0);
+        assert_eq!(render.shadow_cascades, 0);
+        assert_eq!(
+            performance.frame_interval(),
+            None,
+            "0 max_fps leaves the loop uncapped for Talos/ROS2 capture"
+        );
+    }
+
+    #[test]
+    fn repository_config_keeps_the_limits_off() {
+        let config = SimulationConfig::load().expect("config.toml 必须能解析");
+
+        assert_eq!(config.performance.frame_interval(), None);
+        assert_eq!(config.performance.frame_delta_cap(), None);
+        assert_eq!(
+            config.render.view_distance, 0.0,
+            "the shipped config must not change the default far planes"
+        );
+        assert_eq!(config.render.shadow_cascades, 0);
     }
 }

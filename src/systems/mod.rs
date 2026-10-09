@@ -5,6 +5,7 @@ mod debug;
 mod gimbal_pid;
 mod help;
 mod input;
+mod performance;
 mod projectile;
 mod uav;
 pub use camera::*;
@@ -14,6 +15,7 @@ pub use debug::*;
 pub use gimbal_pid::*;
 pub use help::*;
 pub use input::*;
+pub use performance::*;
 pub use projectile::*;
 pub use uav::*;
 
