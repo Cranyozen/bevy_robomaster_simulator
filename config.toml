@@ -66,19 +66,30 @@ acceleration_exponent = 2.5    # exponent for non-linear acceleration curve
 
 # Closed-loop tracking of external auto-aim (Talos/ROS2) gimbal commands.
 # Yaw and pitch are independent loops with independent gains.
+#
+# TUNING NOTE: these were kp = 50.0 / max_rate = 100.0 (rad/s), which is
+# unstable. This is a *discrete* proportional rate loop, so the angle advances by
+# roughly `kp * error * dt` each frame; it only stays stable while `kp * dt < 2`.
+# The render loop runs at a variable 8-55 fps here, so dt reaches ~0.125 s and
+# kp * dt hit 6.25 -- the gimbal then oscillates at ~1.25 Hz and swings through
+# tens of degrees per frame. It looked stable only when the error was ~0 (i.e.
+# parked at the default pose), which is why "stable" and "can see the enemy"
+# appeared to be mutually exclusive.
+#
+# kp = 6.0 keeps kp * dt <= 0.75 even at 8 fps, with a little derivative damping.
 [vehicle.gimbal_pid.yaw]
-kp = 50.0
+kp = 6.0
 ki = 0.0
-kd = 0.1
+kd = 0.05
 integral_limit = 0.5            # rad*s - anti-windup bound on the integral term
-max_rate = 100.0                # rad/s - saturation of the commanded yaw rate
+max_rate = 8.0                  # rad/s - saturation of the commanded yaw rate
 
 [vehicle.gimbal_pid.pitch]
-kp = 50.0
+kp = 6.0
 ki = 0.0
-kd = 0.1
+kd = 0.05
 integral_limit = 0.5            # rad*s - anti-windup bound on the integral term
-max_rate = 100.0                # rad/s - saturation of the commanded pitch rate
+max_rate = 8.0                  # rad/s - saturation of the commanded pitch rate
 
 [mecanum]
 wheel_radius_m = 0.076          # wheel radius (m)
