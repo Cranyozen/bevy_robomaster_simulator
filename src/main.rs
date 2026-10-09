@@ -94,6 +94,30 @@ fn fixed_time_from_config(config: &SimulationConfig) -> Time<Fixed> {
     Time::<Fixed>::from_hz(config.physics.fixed_hz.max(1.0))
 }
 
+/// `ControllerState` with the F5 auto-aim toggle optionally pre-armed.
+///
+/// The gimbal only follows an external solver (`/rm_gimbal/cmd` over ROS 2, or
+/// the Talos shm path) while `SubscribeAutoAim` is set, and that flag mirrors
+/// the F5 toggle every frame. A headless or scripted run has no keyboard, so
+/// `DAEDALUS_AUTO_AIM=1` seeds the initial state of that same toggle. Pressing
+/// F5 later still turns it back off — this only changes where it starts.
+fn controller_state_with_auto_aim_default() -> ControllerState {
+    let mut state = ControllerState::default();
+    let enabled = std::env::var("DAEDALUS_AUTO_AIM")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if enabled {
+        info!("DAEDALUS_AUTO_AIM set: starting with the F5 auto-aim toggle ARMED");
+        state.seed_auto_aim(true);
+    }
+    state
+}
+
 #[cfg(feature = "talos")]
 fn should_enable_talos_plugin(_app: &App) -> bool {
     #[cfg(feature = "ros2")]
@@ -153,7 +177,7 @@ fn main() {
         .init_resource::<ProjectileStatistics>()
         .init_resource::<ChassisObservationFrame>()
         .init_resource::<PreviousKinematicState>()
-        .init_resource::<ControllerState>()
+        .insert_resource(controller_state_with_auto_aim_default())
         .register_type::<ProjectileStatistics>()
         .insert_resource(Gravity(Vec3::NEG_Y * 9.81))
         .insert_resource(SubstepCount(config.physics.substep_count))

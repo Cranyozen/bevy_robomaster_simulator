@@ -166,6 +166,17 @@ impl ControllerState {
         self.keyboard_auto_aim || self.controlled.auto_aim
     }
 
+    /// Arm the same toggle F5 controls, at startup.
+    ///
+    /// F5 is the normal way to hand the gimbal over to an external solver
+    /// (ROS 2 `/rm_gimbal/cmd` or the Talos shm path). A headless or scripted
+    /// run has no keyboard to press it on, so `main` seeds the initial state of
+    /// this one flag from `DAEDALUS_AUTO_AIM`. The semantics are unchanged: F5
+    /// still flips it, so it can always be turned back off.
+    pub fn seed_auto_aim(&mut self, enabled: bool) {
+        self.keyboard_auto_aim = enabled;
+    }
+
     pub fn help_source(&self) -> InputSource {
         self.help.source
     }
