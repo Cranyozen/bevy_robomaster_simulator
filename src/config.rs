@@ -94,6 +94,10 @@ pub struct DebugConfig {
     pub egui: bool,
     pub inspector: bool,
     pub diagnostics: bool,
+    /// On-screen FPS / frame-time readout in the top-right corner. Also gates the
+    /// runtime `F4` toggle: with this off the overlay never renders, so the key
+    /// has no visible effect. Hot-reloadable.
+    pub fps: bool,
 }
 
 impl Default for DebugConfig {
@@ -102,6 +106,7 @@ impl Default for DebugConfig {
             egui: false,
             inspector: false,
             diagnostics: false,
+            fps: true,
         }
     }
 }
@@ -372,11 +377,48 @@ impl Default for CapturePipelineConfig {
     }
 }
 
+/// The color stream that a `--features ros2` build hands to the auto-aim stack.
+///
+/// Everything here exists to keep the image *transport* from eating the control
+/// loop: an uncompressed 1440x1080 `rgb8` frame is 4.66 MB, so the old
+/// "publish every captured frame as `/image_raw`" path put ~230 MB/s through
+/// DDS and made the detector work on frames that were already stale. The knobs
+/// below bound the rate, the size and the encoding independently.
 #[derive(Deserialize, Reflect, Clone)]
 #[serde(default)]
 pub struct CaptureStreamConfig {
     pub width: u32,
     pub height: u32,
+    /// Upper bound on the image publish rate, in Hz. `0` publishes every
+    /// captured frame. Frames that are skipped are skipped *before* the GPU
+    /// readback, so they cost nothing at all (no copy, no conversion, no encode).
+    pub publish_hz: f32,
+    /// Upper bound on the `/camera_info` publish rate, in Hz. The intrinsics are
+    /// constant while the resolution is, and the detector latches the first
+    /// message it sees, so there is no reason to repeat them per frame.
+    pub camera_info_hz: f32,
+    /// Publish `sensor_msgs/CompressedImage` (`jpeg`) on `/image_raw/compressed`.
+    pub publish_compressed: bool,
+    /// Publish `sensor_msgs/Image` (`rgb8`) on `/image_raw`. Off by default:
+    /// 4.66 MB/frame is what used to saturate DDS. Turn it on only to drive a
+    /// consumer that cannot read compressed images.
+    pub publish_raw: bool,
+    /// JPEG quality for `publish_compressed`, clamped to `1..=100`. Lower is
+    /// faster to encode and cheaper on the wire; the armor detector only needs
+    /// enough fidelity to threshold blue light bars.
+    pub jpeg_quality: u8,
+    /// How many captures may be in flight at once, clamped to `1..=8`.
+    ///
+    /// A capture spends most of its life *waiting* for the GPU readback to
+    /// become mappable (~100 ms on an integrated GPU), during which it holds no
+    /// useful CPU. With one slot the image rate collapses to ~1/(that latency);
+    /// a few overlapping slots keep the stream fed. Higher costs latency, since
+    /// a frame waits behind the ones accepted before it.
+    pub max_in_flight: u32,
+    /// Downscale factor applied before publishing, clamped to `0.1..=1.0`.
+    /// `/camera_info` is scaled to match, so PnP stays correct; `1.0` publishes
+    /// the capture resolution untouched.
+    pub scale: f32,
 }
 
 impl Default for CaptureStreamConfig {
@@ -384,8 +426,72 @@ impl Default for CaptureStreamConfig {
         Self {
             width: 1440,
             height: 1080,
+            publish_hz: 30.0,
+            camera_info_hz: 1.0,
+            publish_compressed: true,
+            publish_raw: false,
+            jpeg_quality: 80,
+            max_in_flight: 3,
+            scale: 1.0,
         }
     }
+}
+
+impl CaptureStreamConfig {
+    /// Period between published images, or `None` to publish every frame.
+    pub fn publish_period(&self) -> Option<Duration> {
+        period_from_hz(self.publish_hz)
+    }
+
+    /// Period between `/camera_info` messages, or `None` to publish every frame.
+    pub fn camera_info_period(&self) -> Option<Duration> {
+        period_from_hz(self.camera_info_hz)
+    }
+
+    /// Publish scale, clamped: sub-pixel resolutions are not representable.
+    pub fn scale(&self) -> f32 {
+        if self.scale.is_finite() {
+            self.scale.clamp(MIN_CAPTURE_SCALE, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Published image size after [`Self::scale`], never zero.
+    pub fn published_size(&self) -> (u32, u32) {
+        let scale = self.scale() as f64;
+        (
+            ((self.width as f64 * scale).round().max(1.0)) as u32,
+            ((self.height as f64 * scale).round().max(1.0)) as u32,
+        )
+    }
+
+    /// Capture slots, clamped so a config typo cannot starve or flood the pipeline.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.clamp(1, 8) as usize
+    }
+
+    /// JPEG quality, clamped to the encoder's valid range.
+    pub fn jpeg_quality(&self) -> u8 {
+        self.jpeg_quality.clamp(1, 100)
+    }
+
+    /// Whether any image message is published at all.
+    pub fn wants_image(&self) -> bool {
+        self.publish_raw || self.publish_compressed
+    }
+}
+
+/// Below this the published image is too small for the detector's light-bar
+/// geometry to survive; above 1.0 would be an upsample and is never useful.
+const MIN_CAPTURE_SCALE: f32 = 0.1;
+
+/// `0`/NaN/negative means "no limit"; otherwise one message per `1/hz` seconds.
+fn period_from_hz(hz: f32) -> Option<Duration> {
+    if !hz.is_finite() || hz <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(1.0 / hz.clamp(1e-3, 1000.0) as f64))
 }
 
 #[derive(Deserialize, Reflect, Clone)]
@@ -588,6 +694,24 @@ mod tests {
     }
 
     #[test]
+    fn debug_section_tolerates_missing_fields() {
+        let debug: DebugConfig =
+            toml::from_str("inspector = true\n").expect("partial [debug] section");
+
+        assert!(debug.inspector);
+        assert!(!debug.egui);
+        assert!(!debug.diagnostics);
+        assert!(debug.fps, "FPS 读数默认开启");
+    }
+
+    #[test]
+    fn debug_fps_can_be_turned_off() {
+        let debug: DebugConfig = toml::from_str("fps = false\n").expect("partial [debug] section");
+
+        assert!(!debug.fps);
+    }
+
+    #[test]
     fn limit_sections_tolerate_missing_fields() {
         let performance: PerformanceConfig =
             toml::from_str("max_fps = 60.0\n").expect("partial [performance] section");
@@ -632,5 +756,102 @@ mod tests {
             "the shipped config must not change the default far planes"
         );
         assert_eq!(config.render.shadow_cascades, 0);
+    }
+
+    #[test]
+    fn capture_stream_tolerates_missing_fields() {
+        let color: CaptureStreamConfig =
+            toml::from_str("width = 640\nheight = 480\n").expect("partial [capture.color]");
+
+        assert_eq!(color.published_size(), (640, 480));
+        assert_eq!(
+            color.publish_period(),
+            CaptureStreamConfig::default().publish_period(),
+            "an older config.toml keeps the default publish rate"
+        );
+    }
+
+    #[test]
+    fn capture_rate_zero_or_invalid_means_every_frame() {
+        let unlimited = |hz: f32| CaptureStreamConfig {
+            publish_hz: hz,
+            ..Default::default()
+        };
+
+        for hz in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                unlimited(hz).publish_period(),
+                None,
+                "hz={hz} must not rate limit"
+            );
+        }
+
+        let period = unlimited(30.0)
+            .publish_period()
+            .expect("30 Hz limits the rate");
+        assert!((period.as_secs_f64() - 1.0 / 30.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn capture_scale_is_clamped_and_never_yields_zero_pixels() {
+        let at_scale = |scale: f32| CaptureStreamConfig {
+            width: 1440,
+            height: 1080,
+            scale,
+            ..Default::default()
+        };
+
+        assert_eq!(at_scale(0.5).published_size(), (720, 540));
+        assert_eq!(
+            at_scale(0.0).published_size(),
+            (144, 108),
+            "clamped to the 0.1 floor"
+        );
+        assert_eq!(
+            at_scale(4.0).published_size(),
+            (1440, 1080),
+            "never upsamples"
+        );
+        assert_eq!(at_scale(f32::NAN).published_size(), (1440, 1080));
+    }
+
+    #[test]
+    fn capture_in_flight_is_clamped_to_a_usable_range() {
+        let slots = |max_in_flight: u32| CaptureStreamConfig {
+            max_in_flight,
+            ..Default::default()
+        };
+
+        assert_eq!(slots(0).max_in_flight(), 1, "never zero: that would stall");
+        assert_eq!(slots(99).max_in_flight(), 8);
+        assert_eq!(slots(3).max_in_flight(), 3);
+    }
+
+    #[test]
+    fn capture_jpeg_quality_is_clamped_to_the_encoder_range() {
+        let at_quality = |jpeg_quality: u8| CaptureStreamConfig {
+            jpeg_quality,
+            ..Default::default()
+        };
+
+        assert_eq!(at_quality(0).jpeg_quality(), 1);
+        assert_eq!(at_quality(200).jpeg_quality(), 100);
+        assert_eq!(at_quality(80).jpeg_quality(), 80);
+    }
+
+    #[test]
+    fn shipped_config_publishes_compressed_only() {
+        let config = SimulationConfig::load().expect("config.toml 必须能解析");
+        let color = &config.capture.color;
+
+        assert!(color.wants_image());
+        assert!(
+            color.publish_compressed,
+            "the compressed stream is what keeps DDS affordable"
+        );
+        assert!(
+            color.publish_period().is_some(),
+            "the shipped config rate limits the image stream"
+        );
     }
 }

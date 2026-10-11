@@ -6,7 +6,7 @@ use crate::components::{
 };
 use crate::config::SimulationConfig;
 use crate::robomaster::prelude::{ArmorRoot, PowerRune, RuneIndex, TechCore, tech_core_state_json};
-use crate::ros2::capture::{RosCaptureContext, RosCapturePlugin};
+use crate::ros2::capture::{CaptureGates, RosCaptureContext, RosCapturePlugin};
 use crate::ros2::livox::{RosLivoxContext, RosLivoxPlugin};
 use crate::ros2::prelude::AverageRateLimiter;
 use crate::ros2::prelude::transform;
@@ -245,7 +245,8 @@ fn capture_rune(
     let stamp = Clock::to_builtin_time(&res_unwrap!(clock).get_now().unwrap());
     for (entity, armor_root_tf, armor) in armor {
         let mut tff = armor_center(entity, armor_root_tf);
-        tff.rotation = armor_root_tf.rotation() * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, -PI / 2.0);
+        tff.rotation =
+            armor_root_tf.rotation() * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, -PI / 2.0);
         let tf = transform(tff);
         marker_pub.publish(Marker {
             header: Header {
@@ -316,7 +317,7 @@ fn process_subscription(
     let (gimbal_entity, mut tracker) = gimbal.into_inner();
     fire_rate_limiter.tick(time.delta());
     loop {
-        let Ok(Some(cmd)) = gimbal_cmd.try_recv() else {
+        let Some(cmd) = gimbal_cmd.try_recv() else {
             return;
         };
         // No solution from the solver: drop the target so the PID loop stops driving.
@@ -419,12 +420,45 @@ impl Plugin for ROS2Plugin {
 
         let clock = arc_mutex!(Clock::create(SystemTime).unwrap());
         let fov_y = sim_config.camera.fov.to_radians();
+        let color_stream = &sim_config.capture.color;
         let color_capture_config = CaptureConfig {
-            width: sim_config.capture.color.width,
-            height: sim_config.capture.color.height,
+            width: color_stream.width,
+            height: color_stream.height,
             texture_format: TextureFormat::bevy_default(),
             frame_kind: CapturedFrameKind::Rgb8,
         };
+        // What actually goes on the wire: the capture resolution, unless
+        // `[capture.color] scale` shrinks it. `/camera_info` is derived from the
+        // same numbers, so a downscaled stream still solves PnP correctly.
+        let published_size = color_stream.published_size();
+        let image_period = color_stream.publish_period();
+        let camera_info_period = color_stream.camera_info_period();
+        if !color_stream.wants_image() {
+            warn!(
+                "[ROS2] [capture.color] disables both publish_raw and publish_compressed: \
+                 no image topic will be published"
+            );
+        } else {
+            let rate = match image_period {
+                Some(period) => format!("{:.1} Hz", 1.0 / period.as_secs_f64()),
+                None => "every captured frame".to_string(),
+            };
+            let topics = match (color_stream.publish_compressed, color_stream.publish_raw) {
+                (true, true) => "/image_raw/compressed + /image_raw",
+                (true, false) => "/image_raw/compressed",
+                _ => "/image_raw",
+            };
+            info!(
+                "[ROS2] color stream: {}x{} -> {}x{} on {} at {} (jpeg quality {})",
+                color_stream.width,
+                color_stream.height,
+                published_size.0,
+                published_size.1,
+                topics,
+                rate,
+                color_stream.jpeg_quality(),
+            );
+        }
         let depth_capture_config = CaptureConfig {
             width: sim_config.capture.depth.width,
             height: sim_config.capture.depth.height,
@@ -444,7 +478,15 @@ impl Plugin for ROS2Plugin {
                 context: RosCaptureContext {
                     clock: clock.clone(),
                     fov_y,
-                    publish_compressed: false,
+                    publish_compressed: color_stream.publish_compressed,
+                    publish_raw: color_stream.publish_raw,
+                    jpeg_quality: color_stream.jpeg_quality(),
+                    published_size,
+                    gates: Arc::new(CaptureGates::new(
+                        image_period,
+                        camera_info_period,
+                        color_stream.max_in_flight(),
+                    )),
                     camera_info,
                     image_raw,
                     image_compressed,

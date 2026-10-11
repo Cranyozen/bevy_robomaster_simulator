@@ -2,7 +2,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::schedule::camera_driver;
 use bevy::ecs::world::DeferredWorld;
 use bevy::render::texture::GpuImage;
-use bevy::tasks::AsyncComputeTaskPool;
+use bevy::tasks::futures_lite::future::block_on;
 use bevy::{
     image::TextureFormatPixelInfo,
     prelude::*,
@@ -10,13 +10,14 @@ use bevy::{
         Render, RenderApp, RenderSystems,
         render_asset::RenderAssets,
         render_resource::{
-            Buffer, BufferDescriptor, BufferUsages, Extent3d, MapMode, Origin3d,
+            Buffer, BufferAsyncError, BufferDescriptor, BufferUsages, Extent3d, MapMode, Origin3d,
             TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
             TextureFormat, TextureUsages,
         },
         renderer::{RenderContext, RenderDevice, RenderGraph, RenderGraphSystems},
     },
 };
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -633,6 +634,93 @@ fn image_copy_driver(world: &World, mut render_context: RenderContext) {
     }
 }
 
+/// One captured frame on its way to the snapshot handlers.
+struct CaptureJob {
+    buffer: Buffer,
+    mapped: futures::channel::oneshot::Receiver<Result<(), BufferAsyncError>>,
+    snapshots: Vec<(Option<CaptureFrameId>, Box<dyn SnapshotAsync>)>,
+    width: u32,
+    height: u32,
+    texture_format: TextureFormat,
+    frame_kind: CapturedFrameKind,
+    free_buffers: Arc<Mutex<Vec<Buffer>>>,
+    free_frames: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+/// Single FIFO worker for every copier's readback.
+///
+/// WHY A DEDICATED THREAD INSTEAD OF ONE POOL TASK PER FRAME: the expensive part
+/// of a capture is *waiting* — `map_async` completes on a later device poll, so
+/// a readback occupies ~100 ms of wall clock while costing almost no CPU. A task
+/// per frame lets those waits overlap, but tasks are unordered, so frames could
+/// be handed to the topic publishers out of order, and the number in flight was
+/// unbounded.
+///
+/// With one worker the maps still overlap (the render loop submits one per
+/// frame) but the conversion, encode and publish happen strictly in capture
+/// order, and the depth is bounded by the accept gate on the render side.
+#[derive(Resource)]
+struct CaptureWorker {
+    jobs: Sender<CaptureJob>,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl CaptureWorker {
+    fn new() -> Self {
+        let (jobs, queue): (Sender<CaptureJob>, Receiver<CaptureJob>) = unbounded();
+        let handle = std::thread::Builder::new()
+            .name("capture-readback".to_string())
+            .spawn(move || {
+                for job in queue.iter() {
+                    let CaptureJob {
+                        buffer,
+                        mapped,
+                        snapshots,
+                        width,
+                        height,
+                        texture_format,
+                        frame_kind,
+                        free_buffers,
+                        free_frames,
+                    } = job;
+
+                    block_on(mapped)
+                        .expect("capture buffer map channel dropped")
+                        .expect("Failed to map buffer");
+
+                    let layout = FrameLayout::new(frame_kind, texture_format, width, height)
+                        .expect("Unsupported capture texture format");
+                    let mut frame_bytes = acquire_frame_buffer(&free_frames, layout.output_len());
+
+                    {
+                        let mapped = buffer.slice(..).get_mapped_range();
+                        layout.write(&mapped, &mut frame_bytes);
+                    }
+                    buffer.unmap();
+                    free_buffers.lock().unwrap().push(buffer);
+
+                    for (frame_id, mut snapshot) in snapshots {
+                        snapshot.captured(CapturedFrame {
+                            frame_id,
+                            kind: frame_kind,
+                            width,
+                            height,
+                            data: frame_bytes.as_slice(),
+                        });
+                    }
+
+                    free_frames.lock().unwrap().push(frame_bytes);
+                }
+            })
+            .expect("failed to spawn the capture readback thread");
+
+        Self {
+            jobs,
+            _handle: handle,
+        }
+    }
+}
+
 fn receive_image_from_buffer(mut world: DeferredWorld) {
     let copier_count = world.resource::<ImageCopiers>().len();
     if copier_count == 0 {
@@ -676,10 +764,9 @@ fn receive_image_from_buffer(mut world: DeferredWorld) {
             continue;
         };
 
-        // The callback only signals completion; the conversion happens on the async pool, reading
-        // the mapped range in place. That keeps the heavy work off the polling thread without the
-        // full-frame copy an intermediate `Vec` would cost.
-        let (s, r) = futures::channel::oneshot::channel();
+        // The callback only signals completion; the conversion happens on the
+        // worker, reading the mapped range in place.
+        let (s, mapped) = futures::channel::oneshot::channel();
         buffer.slice(..).map_async(MapMode::Read, move |result| {
             let _ = s.send(result);
         });
@@ -691,38 +778,23 @@ fn receive_image_from_buffer(mut world: DeferredWorld) {
                 (frame_id, snapshot.captured(&mut world, &config))
             })
             .collect();
-        let frame_kind = config.frame_kind;
 
-        AsyncComputeTaskPool::get()
-            .spawn(async move {
-                r.await
-                    .expect("capture buffer map channel dropped")
-                    .expect("Failed to map buffer");
-
-                let layout = FrameLayout::new(frame_kind, texture_format, width, height)
-                    .expect("Unsupported capture texture format");
-                let mut frame_bytes = acquire_frame_buffer(&free_frames, layout.output_len());
-
-                {
-                    let mapped = buffer.slice(..).get_mapped_range();
-                    layout.write(&mapped, &mut frame_bytes);
-                }
-                buffer.unmap();
-                free_buffers.lock().unwrap().push(buffer);
-
-                for (frame_id, mut snapshot) in snapshots {
-                    snapshot.captured(CapturedFrame {
-                        frame_id,
-                        kind: frame_kind,
-                        width,
-                        height,
-                        data: frame_bytes.as_slice(),
-                    });
-                }
-
-                free_frames.lock().unwrap().push(frame_bytes);
+        let sent = world
+            .resource::<CaptureWorker>()
+            .jobs
+            .send(CaptureJob {
+                buffer,
+                mapped,
+                snapshots,
+                width,
+                height,
+                texture_format,
+                frame_kind: config.frame_kind,
+                free_buffers,
+                free_frames,
             })
-            .detach();
+            .is_ok();
+        debug_assert!(sent, "capture worker thread is gone");
     }
 }
 
@@ -816,6 +888,7 @@ impl Plugin for CameraCapturePlugin {
 
         let installed = render_app.world().resource::<ImageCopyDriverInstalled>().0;
         if !installed {
+            render_app.world_mut().insert_resource(CaptureWorker::new());
             render_app.add_systems(
                 RenderGraph,
                 image_copy_driver

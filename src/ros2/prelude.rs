@@ -1,6 +1,6 @@
 use bevy::math::{Mat3, Quat, Vec3};
 use bevy::prelude::Transform;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct AverageRateLimiter {
@@ -31,6 +31,61 @@ impl AverageRateLimiter {
         }
         self.elapsed = Duration::ZERO;
         true
+    }
+}
+
+/// Wall-clock rate gate: "has `period` elapsed since the last time I said yes?".
+///
+/// [`AverageRateLimiter`] is driven by the caller ticking it with a frame delta,
+/// which is what the `Update`-driven publishers want. This one is driven by
+/// `Instant::now()` instead, because the capture path has to decide *inside a
+/// render-graph node* (and inside the render world) whether this frame is worth
+/// reading back from the GPU at all — there is no `Res<Time>` to tick with, and
+/// the decision has to be made before any work is done.
+///
+/// `period` of `None` (or [`Duration::ZERO`]) always allows, so "no limit" needs
+/// no special case at the call site.
+#[derive(Debug, Clone)]
+pub struct WallRateLimiter {
+    period: Option<Duration>,
+    last: Option<Instant>,
+}
+
+impl WallRateLimiter {
+    pub fn new(period: Option<Duration>) -> Self {
+        Self {
+            period: period.filter(|p| !p.is_zero()),
+            last: None,
+        }
+    }
+
+    /// `None` disables the gate; `Some(period)` allows at most one call per `period`.
+    pub fn from_period(period: Option<Duration>) -> Self {
+        Self::new(period)
+    }
+
+    /// Whether this call may proceed. The first call after construction always
+    /// may — otherwise a 1 Hz `/camera_info` gate would delay startup by a
+    /// second, and the detector needs the intrinsics before its first solve.
+    pub fn allow(&mut self) -> bool {
+        self.allow_at(Instant::now())
+    }
+
+    /// [`Self::allow`] against an explicit clock, so the behaviour is testable
+    /// without sleeping.
+    pub fn allow_at(&mut self, now: Instant) -> bool {
+        let Some(period) = self.period else {
+            self.last = Some(now);
+            return true;
+        };
+        let due = match self.last {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= period,
+        };
+        if due {
+            self.last = Some(now);
+        }
+        due
     }
 }
 
@@ -103,4 +158,65 @@ macro_rules! pose {
             },
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_gate_allows_every_call() {
+        let mut gate = WallRateLimiter::from_period(None);
+        let t0 = Instant::now();
+
+        for step in 0..5 {
+            assert!(
+                gate.allow_at(t0 + Duration::from_micros(step)),
+                "a disabled gate must not throttle"
+            );
+        }
+
+        let mut zero = WallRateLimiter::from_period(Some(Duration::ZERO));
+        assert!(zero.allow_at(t0));
+        assert!(zero.allow_at(t0), "Duration::ZERO is the same as no limit");
+    }
+
+    #[test]
+    fn gate_allows_the_first_call_then_waits_out_the_period() {
+        let t0 = Instant::now();
+        let mut gate = WallRateLimiter::from_period(Some(Duration::from_millis(33)));
+
+        assert!(gate.allow_at(t0), "the first frame must not be delayed");
+        assert!(!gate.allow_at(t0 + Duration::from_millis(32)));
+        assert!(gate.allow_at(t0 + Duration::from_millis(33)));
+        assert!(
+            !gate.allow_at(t0 + Duration::from_millis(34)),
+            "the gate re-anchors on the accepted call, not on every call"
+        );
+        assert!(gate.allow_at(t0 + Duration::from_millis(66)));
+    }
+
+    #[test]
+    fn gate_catches_up_without_bursting() {
+        let t0 = Instant::now();
+        let mut gate = WallRateLimiter::from_period(Some(Duration::from_millis(10)));
+
+        assert!(gate.allow_at(t0));
+        // A long stall (a hitch, a paused window) must not queue up a burst of
+        // publishes: one frame may go out, the rest of the backlog is dropped.
+        assert!(gate.allow_at(t0 + Duration::from_secs(5)));
+        assert!(!gate.allow_at(t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn average_limiter_still_ticks() {
+        // Built from an exact Duration: `from_hz` rounds through f32, which would
+        // make a nominal 100 ms period a nanosecond longer than tick(100 ms).
+        let mut limiter = AverageRateLimiter::new(Duration::from_millis(100));
+
+        assert!(limiter.allow());
+        assert!(!limiter.allow());
+        limiter.tick(Duration::from_millis(100));
+        assert!(limiter.allow());
+    }
 }
