@@ -98,6 +98,10 @@ pub struct DebugConfig {
     /// runtime `F4` toggle: with this off the overlay never renders and the key is
     /// ignored. Hot-reloadable.
     pub fps: bool,
+    /// Top-center toast after `config.toml` is hot-reloaded, saying whether the
+    /// edit was applied or rejected. Set to `false` to keep the HUD quiet; the
+    /// console log is written either way. Hot-reloadable.
+    pub reload_notice: bool,
 }
 
 impl Default for DebugConfig {
@@ -107,6 +111,7 @@ impl Default for DebugConfig {
             inspector: false,
             diagnostics: false,
             fps: true,
+            reload_notice: true,
         }
     }
 }
@@ -415,6 +420,17 @@ pub struct CaptureStreamConfig {
     /// a few overlapping slots keep the stream fed. Higher costs latency, since
     /// a frame waits behind the ones accepted before it.
     pub max_in_flight: u32,
+    /// How many threads encode JPEG frames in parallel, clamped to `1..=8`.
+    ///
+    /// `image`'s JPEG encoder is scalar — measured ~21 Mpix/s, i.e. ~47 ms for one
+    /// 1440x1080 frame — so encoding every frame on the single capture-readback
+    /// thread pins the image rate at ~21 Hz and leaves that thread at 100% of one
+    /// core while the rest of the machine idles. Encoding on `N` threads lifts the
+    /// ceiling to roughly `N x` that, at the cost of `N-1` more cores' worth of
+    /// CPU during the encode. Frames are still *published* strictly in capture
+    /// order (the detector feeds header stamps to an EKF), so this changes
+    /// throughput only, not the message sequence.
+    pub encode_threads: u32,
     /// Downscale factor applied before publishing, clamped to `0.1..=1.0`.
     /// `/camera_info` is scaled to match, so PnP stays correct; `1.0` publishes
     /// the capture resolution untouched.
@@ -432,6 +448,7 @@ impl Default for CaptureStreamConfig {
             publish_raw: false,
             jpeg_quality: 80,
             max_in_flight: 3,
+            encode_threads: 3,
             scale: 1.0,
         }
     }
@@ -474,6 +491,12 @@ impl CaptureStreamConfig {
     /// JPEG quality, clamped to the encoder's valid range.
     pub fn jpeg_quality(&self) -> u8 {
         self.jpeg_quality.clamp(1, 100)
+    }
+
+    /// Encoder threads, clamped so a config typo cannot spawn a pool or disable
+    /// the pipeline: 1 thread means "encode inline on the capture worker".
+    pub fn encode_threads(&self) -> usize {
+        self.encode_threads.clamp(1, 8) as usize
     }
 
     /// Whether any image message is published at all.
@@ -586,11 +609,37 @@ pub struct ConfigWatcher {
     receiver: Receiver<Result<Event, notify::Error>>,
 }
 
+/// The file the watcher above follows. Kept in one place so the on-screen notice
+/// names the same file the watcher actually reads.
+pub const CONFIG_PATH: &str = "config.toml";
+
+/// How one hot-reload attempt ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigReloadOutcome {
+    /// The edited file parsed and replaced the whole `SimulationConfig`.
+    Applied,
+    /// The edit did not parse, so the previously running config stays in effect.
+    Failed(String),
+}
+
+/// Broadcast by `config_hot_reload` after every attempt, so the HUD can tell the
+/// user what the console already logged. The config side stays free of UI types:
+/// whoever wants to show it just reads this message.
+#[derive(Message, Clone, Debug, PartialEq, Eq)]
+pub struct ConfigReloaded {
+    pub outcome: ConfigReloadOutcome,
+}
+
 pub struct ConfigPlugin;
 
 impl Plugin for ConfigPlugin {
     fn build(&self, app: &mut App) {
         let config = SimulationConfig::default();
+
+        // Registered up front and unconditionally: `config_hot_reload` writes into
+        // it, and a reader in another plugin would panic at startup if the writer
+        // only ever got registered on the branch where the watcher came up.
+        app.add_message::<ConfigReloaded>();
 
         // Set up file watcher using crossbeam-channel for thread safety
         let (tx, rx): (
@@ -606,8 +655,7 @@ impl Plugin for ConfigPlugin {
 
         match watcher_result {
             Ok(mut watcher) => {
-                if let Err(e) = watcher.watch(Path::new("config.toml"), RecursiveMode::NonRecursive)
-                {
+                if let Err(e) = watcher.watch(Path::new(CONFIG_PATH), RecursiveMode::NonRecursive) {
                     warn!("Failed to watch config.toml: {}", e);
                 } else {
                     info!("Config hot-reload enabled for config.toml");
@@ -633,15 +681,22 @@ fn config_hot_reload(
     watcher: Option<Res<ConfigWatcher>>,
     mut substeps: Option<ResMut<SubstepCount>>,
     mut fixed_time: Option<ResMut<Time<Fixed>>>,
+    mut reloaded: MessageWriter<ConfigReloaded>,
 ) {
     let Some(watcher) = watcher else {
         return;
     };
 
+    // A single save usually arrives as several `Modify` events (editors truncate,
+    // write, then rename), and they are all drained in this one frame. The HUD has
+    // exactly one line to show, so only the last attempt is reported — one notice
+    // per save instead of one per event.
+    let mut outcome = None;
+
     // Non-blocking check for file changes
     while let Ok(Ok(event)) = watcher.receiver.try_recv() {
         if event.kind.is_modify() {
-            match SimulationConfig::load() {
+            outcome = Some(match SimulationConfig::load() {
                 Ok(new_config) => {
                     info!("Config reloaded successfully");
                     if let Some(substeps) = substeps.as_deref_mut() {
@@ -651,12 +706,18 @@ fn config_hot_reload(
                         *fixed_time = Time::<Fixed>::from_hz(new_config.physics.fixed_hz.max(1.0));
                     }
                     *config = new_config;
+                    ConfigReloadOutcome::Applied
                 }
                 Err(e) => {
                     warn!("Failed to reload config: {}", e);
+                    ConfigReloadOutcome::Failed(e.to_string())
                 }
-            }
+            });
         }
+    }
+
+    if let Some(outcome) = outcome {
+        reloaded.write(ConfigReloaded { outcome });
     }
 }
 
@@ -702,6 +763,7 @@ mod tests {
         assert!(!debug.egui);
         assert!(!debug.diagnostics);
         assert!(debug.fps, "FPS 读数默认开启");
+        assert!(debug.reload_notice, "热重载提示默认开启");
     }
 
     #[test]
@@ -709,6 +771,14 @@ mod tests {
         let debug: DebugConfig = toml::from_str("fps = false\n").expect("partial [debug] section");
 
         assert!(!debug.fps);
+    }
+
+    #[test]
+    fn debug_reload_notice_can_be_turned_off() {
+        let debug: DebugConfig =
+            toml::from_str("reload_notice = false\n").expect("partial [debug] section");
+
+        assert!(!debug.reload_notice);
     }
 
     #[test]

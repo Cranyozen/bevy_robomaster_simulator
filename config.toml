@@ -27,6 +27,10 @@ diagnostics = true
 # Setting this to false hides the overlay and turns F4 into a no-op (the key is
 # ignored rather than latched).
 fps = true
+# Top-center toast after config.toml is hot-reloaded: green for "applied",
+# red for "rejected — the old config is still running". Set to false to keep
+# the HUD quiet; the console log is written either way.
+reload_notice = true
 
 [preview]
 # On-screen preview camera. Disable to avoid rendering the scene twice (preview + capture).
