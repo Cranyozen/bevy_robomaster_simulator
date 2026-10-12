@@ -64,18 +64,27 @@ width = 1440
 height = 1080
 
 # --- image transport budget (ROS 2 only) --------------------------------------
-# Measured on this machine (AMD iGPU), control-loop input rate = /tracker/target:
+# Measured on this machine (AMD iGPU). Control-loop rate = /detector/armors, i.e.
+# how often the detector actually gets a fresh frame:
 #
-#   raw 1440x1080, every frame   ->  6.9 Hz,  25 MB/s, sim 20 fps
-#   raw 1440x1080, 30 Hz, 3 deep -> 11.1 Hz,  48 MB/s, sim 13 fps
-#   JPEG 1440x1080,  30 Hz       ->  4.7 Hz, 0.5 MB/s, sim 60 fps
-#   JPEG 720x540,    30 Hz, 3 deep -> 15.9 Hz, 0.3 MB/s, sim 30 fps   <- shipped
+#   raw  1440x1080, every frame     ->  6.9 Hz,   25 MB/s, sim 20 fps
+#   raw  1440x1080, 30 Hz, 3 deep   -> 11.1 Hz,   48 MB/s, sim 13 fps
+#   JPEG 1440x1080, 30 Hz, 3 deep   -> 12.0 Hz, 0.45 MB/s, sim ~60 fps   <- shipped
+#   JPEG  720x540, 30 Hz, 3 deep    -> 15.9 Hz, 0.31 MB/s, sim 30 fps
 #
-# The binding constraints are the GPU readback (~100 ms per frame, which is why
-# `max_in_flight` matters) and `image`'s scalar JPEG encoder (21 Mpix/s: ~190 ms
-# for a full-resolution frame). DDS itself is not a limit here — a synthetic
-# publisher pushed 221 MB/s through it. Prefer raw over JPEG only if you need the
-# full capture resolution; expect ~11 Hz and ~50 MB/s.
+# The binding constraints are the GPU readback (~100 ms per capture, which is why
+# `max_in_flight` matters) and `image`'s scalar JPEG encoder (~83 ms for a
+# full-resolution frame). DDS itself is not a limit: a synthetic publisher pushed
+# 221 MB/s through it.
+#
+# DO NOT LOWER `scale` WITHOUT RE-TESTING DETECTION. The 720x540 row looks better
+# on every axis until you check whether the armor detector still works: with the
+# target filling the view at a fixed pose it found armors in 0 of 130 frames at
+# 720x540, against 120 of 130 at 1440x1080. At half resolution the light bars
+# fragment, so the pairs it forms have a bar-length ratio of 0.32-0.77 (the
+# detector wants > 0.8) and centre distances of 13-37 bar lengths (it wants
+# 0.8-5.5) — i.e. no armor is ever assembled. Full resolution is what makes the
+# auto-aim lock at all.
 
 # Upper bound on the image publish rate, in Hz. 0 = every captured frame.
 # Frames that are skipped are dropped *before* the GPU readback, so they cost
@@ -83,26 +92,25 @@ height = 1080
 publish_hz = 30.0
 # How many captures may be in flight at once, 1..=8. A readback waits ~100 ms for
 # `map_async` to land on a later device poll while costing almost no CPU, so 1
-# slot caps the stream at ~6 Hz whatever else is set. 3 buys ~2.5x and costs up
-# to one frame of extra latency.
+# slot caps the stream at ~6 Hz whatever else is set. 3 buys ~2x and costs up to
+# one frame of extra latency.
 max_in_flight = 3
 # Upper bound on the `/camera_info` publish rate, in Hz. The intrinsics only
 # change when the resolution does and the detector latches the first message.
 camera_info_hz = 1.0
 # Publish JPEG on `/image_raw/compressed` (sensor_msgs/CompressedImage).
 publish_compressed = true
-# Publish raw rgb8 on `/image_raw` as well. Off by default: 4.66 MB per frame at
-# the capture resolution. Turn it on only for a consumer that cannot decode
-# compressed images, and expect the rate above.
+# Publish raw rgb8 on `/image_raw` as well. Off by default: 4.66 MB per frame, and
+# measured *slower* than the compressed path (11.1 Hz vs 12.0 Hz) because the
+# extra readback/transport drags the render loop down to ~13 fps — which also
+# slows the gimbal PID, since that runs per rendered frame.
 publish_raw = false
 # JPEG quality, 1..=100. Lower is cheaper on the CPU and the wire.
 jpeg_quality = 80
 # Downscale before publishing, 0.1..=1.0. `/camera_info` is scaled to match, so
-# PnP stays correct. This is the rate-vs-detail dial: 0.5 roughly halves the JPEG
-# encoder's work per frame and 4x-cuts the readback, which is worth ~1.5x more
-# images per second (see the table above). A half-size image is still ~29 px of
-# armor at 3 m; set 1.0 when you need long-range detection more than rate.
-scale = 0.5
+# PnP stays correct, but the *detector* is what breaks first — see the warning
+# above. Keep 1.0 unless you have verified detection in your own scene.
+scale = 1.0
 
 [capture.depth]
 # Depth capture resolution for livox-compatible point cloud output.
