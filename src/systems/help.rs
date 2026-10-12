@@ -248,6 +248,7 @@ const RIGHT_SECTIONS: &[HintSection] = &[
                 hint(&["F3"], "Camera mode", HintScope::ANY),
                 hint(&["F5"], "Auto-aim toggle", HintScope::ANY),
             ]),
+            row(&[hint(&["F4"], "FPS overlay on / off", HintScope::ANY)]),
             row(&[
                 hint(&["O"], "Follow own / slapper", KEYBOARD),
                 hint(&["A"], "Follow own / slapper", GAMEPAD),

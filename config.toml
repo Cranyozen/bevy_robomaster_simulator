@@ -23,6 +23,10 @@ egui = false
 inspector = false
 # Prints FPS/frametime diagnostics to console.
 diagnostics = true
+# On-screen FPS / frame-time readout in the top-right corner. Runtime toggle: F4.
+# Setting this to false hides the overlay and turns F4 into a no-op (the key is
+# ignored rather than latched).
+fps = true
 
 [preview]
 # On-screen preview camera. Disable to avoid rendering the scene twice (preview + capture).

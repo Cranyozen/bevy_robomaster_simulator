@@ -95,8 +95,8 @@ pub struct DebugConfig {
     pub inspector: bool,
     pub diagnostics: bool,
     /// On-screen FPS / frame-time readout in the top-right corner. Also gates the
-    /// runtime `F4` toggle: with this off the overlay never renders, so the key
-    /// has no visible effect. Hot-reloadable.
+    /// runtime `F4` toggle: with this off the overlay never renders and the key is
+    /// ignored. Hot-reloadable.
     pub fps: bool,
 }
 
