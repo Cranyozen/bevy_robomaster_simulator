@@ -9,7 +9,9 @@
 
 use bevy::prelude::*;
 
+use crate::capture::effect::LensPreview;
 use crate::components::{CameraFocus, CameraMode, FollowingType};
+use crate::config::SimulationConfig;
 use crate::statistic::ProjectileStatistics;
 use crate::systems::{ControllerState, GameplaySystems, InputSource};
 
@@ -257,6 +259,7 @@ const RIGHT_SECTIONS: &[HintSection] = &[
                 hint(&["F6"], "Inset on / off", KEYBOARD),
                 hint(&["B"], "Inset on / off", GAMEPAD),
             ]),
+            row(&[hint(&["F7"], "Lens sim / clean preview", HintScope::ANY)]),
         ],
     ),
 ];
@@ -281,19 +284,21 @@ enum HintChip {
     Target,
     Gyro,
     SlapperGyro,
+    Lens,
     Accuracy,
 }
 
 #[derive(Component, Clone, Copy)]
 struct HintChipLabel(HintChip);
 
-const CHIPS: [HintChip; 7] = [
+const CHIPS: [HintChip; 8] = [
     HintChip::Source,
     HintChip::Mode,
     HintChip::View,
     HintChip::Target,
     HintChip::Gyro,
     HintChip::SlapperGyro,
+    HintChip::Lens,
     HintChip::Accuracy,
 ];
 
@@ -597,16 +602,27 @@ fn apply_help_visibility(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_help_panel(
     controller: Res<ControllerState>,
     camera: Res<CameraMode>,
     focus: Res<CameraFocus>,
     statistics: Res<ProjectileStatistics>,
+    config: Res<SimulationConfig>,
+    lens: Res<LensPreview>,
     mut chips: Query<(&HintChip, &mut BackgroundColor, &mut BorderColor)>,
     mut labels: Query<(&HintChipLabel, &mut Text, &mut TextColor)>,
 ) {
     for (chip, mut background, mut border) in &mut chips {
-        let (_, accent) = chip_content(*chip, &controller, &camera, &focus, &statistics);
+        let (_, accent) = chip_content(
+            *chip,
+            &controller,
+            &camera,
+            &focus,
+            &statistics,
+            &config,
+            &lens,
+        );
         let background_color = accent.with_alpha(0.14);
         if background.0 != background_color {
             background.0 = background_color;
@@ -618,7 +634,15 @@ fn update_help_panel(
     }
 
     for (label, mut text, mut color) in &mut labels {
-        let (content, accent) = chip_content(label.0, &controller, &camera, &focus, &statistics);
+        let (content, accent) = chip_content(
+            label.0,
+            &controller,
+            &camera,
+            &focus,
+            &statistics,
+            &config,
+            &lens,
+        );
         if text.0 != content {
             text.0 = content;
         }
@@ -628,12 +652,15 @@ fn update_help_panel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chip_content(
     chip: HintChip,
     controller: &ControllerState,
     camera: &CameraMode,
     focus: &CameraFocus,
     statistics: &ProjectileStatistics,
+    config: &SimulationConfig,
+    lens: &LensPreview,
 ) -> (String, Color) {
     const NEUTRAL: Color = Color::srgb(0.60, 0.66, 0.74);
     const ACTIVE: Color = Color::srgb(0.44, 0.86, 0.56);
@@ -668,6 +695,17 @@ fn chip_content(
         ),
         HintChip::Gyro => spin_label("GYRO", controller.controlled_chassis_spin()),
         HintChip::SlapperGyro => spin_label("SLAPPER GYRO", controller.remote_chassis_spin()),
+        // The lens chip reports what the *preview* shows, not what is published:
+        // the capture camera keeps the layer for ROS 2 / Talos regardless.
+        HintChip::Lens => {
+            if !config.capture.effect.enabled {
+                ("LENS OFF".to_string(), NEUTRAL)
+            } else if lens.show_effect() {
+                ("LENS SIM".to_string(), SKY)
+            } else {
+                ("LENS CLEAN".to_string(), NEUTRAL)
+            }
+        }
         HintChip::Accuracy => (
             format!(
                 "HIT {:.0}% ({}/{})",
@@ -822,27 +860,37 @@ mod tests {
         let camera = CameraMode::default();
         let mut focus = CameraFocus::default();
         let mut statistics = ProjectileStatistics::default();
+        let config = SimulationConfig::default();
+        let lens = LensPreview::default();
 
-        let (label, _) = chip_content(HintChip::Source, &controller, &camera, &focus, &statistics);
+        let chip = |chip: HintChip,
+                    controller: &ControllerState,
+                    camera: &CameraMode,
+                    focus: &CameraFocus,
+                    statistics: &ProjectileStatistics| {
+            chip_content(chip, controller, camera, focus, statistics, &config, &lens)
+        };
+
+        let (label, _) = chip(HintChip::Source, &controller, &camera, &focus, &statistics);
         assert_eq!(label, "KEYBOARD");
 
-        let (label, _) = chip_content(HintChip::Mode, &controller, &camera, &focus, &statistics);
+        let (label, _) = chip(HintChip::Mode, &controller, &camera, &focus, &statistics);
         assert_eq!(label, "MANUAL");
 
         controller.controlled.auto_aim = true;
-        let (label, _) = chip_content(HintChip::Mode, &controller, &camera, &focus, &statistics);
+        let (label, _) = chip(HintChip::Mode, &controller, &camera, &focus, &statistics);
         assert_eq!(label, "AUTO-AIM");
 
-        let (label, _) = chip_content(HintChip::Target, &controller, &camera, &focus, &statistics);
+        let (label, _) = chip(HintChip::Target, &controller, &camera, &focus, &statistics);
         assert_eq!(label, "TARGET OWN");
 
         focus.toggle();
-        let (label, _) = chip_content(HintChip::Target, &controller, &camera, &focus, &statistics);
+        let (label, _) = chip(HintChip::Target, &controller, &camera, &focus, &statistics);
         assert_eq!(label, "TARGET SLAPPER");
 
         statistics.launch_count = 2;
         statistics.accurate_count = 1;
-        let (label, _) = chip_content(
+        let (label, _) = chip(
             HintChip::Accuracy,
             &controller,
             &camera,
@@ -853,6 +901,35 @@ mod tests {
 
         assert_eq!(spin_label("GYRO", true).0, "GYRO ON");
         assert_eq!(spin_label("GYRO", false).0, "GYRO OFF");
+    }
+
+    #[test]
+    fn the_lens_chip_reports_what_the_preview_shows() {
+        let controller = ControllerState::default();
+        let camera = CameraMode::default();
+        let focus = CameraFocus::default();
+        let statistics = ProjectileStatistics::default();
+        let mut config = SimulationConfig::default();
+        let mut lens = LensPreview::default();
+
+        let label = |config: &SimulationConfig, lens: &LensPreview| {
+            chip_content(
+                HintChip::Lens,
+                &controller,
+                &camera,
+                &focus,
+                &statistics,
+                config,
+                lens,
+            )
+            .0
+        };
+
+        assert_eq!(label(&config, &lens), "LENS SIM", "默认与 ROS 看到的一致");
+        lens.set(false);
+        assert_eq!(label(&config, &lens), "LENS CLEAN", "只看预览切干净没有");
+        config.capture.effect.enabled = false;
+        assert_eq!(label(&config, &lens), "LENS OFF", "整层关掉时是第三态");
     }
 
     fn keys_for(state: HintState, action: &str) -> Vec<&'static str> {

@@ -27,6 +27,7 @@ use bevy_inspector_egui::bevy_egui::EguiPlugin;
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use std::sync::atomic::AtomicBool;
 
+use crate::capture::effect::CameraLensEffectPlugin;
 use crate::components::{
     CameraFocus, CameraMode, FollowingType, PictureInPictureState, ProjectileCooldown,
     SubscribeAutoAim,
@@ -169,6 +170,7 @@ fn main() {
 
     app.add_plugins(RoboMasterPlugins)
         .add_plugins(MetalFxPlugin)
+        .add_plugins(CameraLensEffectPlugin)
         .add_plugins(HelpPlugin)
         .add_plugins(FpsDisplayPlugin)
         .add_plugins(NoticePlugin)

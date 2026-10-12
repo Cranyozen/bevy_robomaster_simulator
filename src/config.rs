@@ -371,6 +371,9 @@ impl Default for CameraConfig {
 pub struct CapturePipelineConfig {
     pub color: CaptureStreamConfig,
     pub depth: DepthCaptureConfig,
+    /// Simulated lens and sensor in front of the capture camera. See
+    /// [`CaptureEffectConfig`].
+    pub effect: CaptureEffectConfig,
 }
 
 impl Default for CapturePipelineConfig {
@@ -378,8 +381,140 @@ impl Default for CapturePipelineConfig {
         Self {
             color: CaptureStreamConfig::default(),
             depth: DepthCaptureConfig::default(),
+            effect: CaptureEffectConfig::default(),
         }
     }
+}
+
+/// The simulated camera lens and sensor the *capture* camera renders through, from
+/// `config.toml` → `[capture.effect]`.
+///
+/// The capture camera is the robot's camera: its image is what ROS 2 publishes on
+/// `/image_raw*`, what the Talos shm link sends, and what the on-screen preview
+/// mirrors. Putting the layer there is what makes it impossible for the published
+/// image and the preview to disagree — and what makes the `F7` preview toggle
+/// unable to change the published image.
+///
+/// DEFAULTS: a visible but gentle lens. Enough vignetting and grain that a
+/// threshold-based detector meets the same noise it will meet on the robot, but
+/// not so much that it fails here for reasons it will not hit there. Every knob is
+/// clamped by the accessors below, so a typo cannot produce a black or smeared
+/// frame.
+///
+/// WHAT TO RAISE FIRST: `grain` (the sensor half of the simulation) and
+/// `vignette`. Leave `lens_distortion` at zero unless the consumer expects it —
+/// see that field.
+#[derive(Deserialize, Reflect, Clone)]
+#[serde(default)]
+pub struct CaptureEffectConfig {
+    /// Master switch for the whole layer. `false` leaves the capture camera — and
+    /// therefore the published image — completely clean, and turns `F7` into a
+    /// no-op. Easier to reach than the individual knobs when a detector is being
+    /// calibrated and every unknown should be removed at once.
+    pub enabled: bool,
+    /// What the on-screen preview starts with: `true` = the simulated camera,
+    /// i.e. exactly what ROS 2/Talos receive, `false` = the clean render. `F7`
+    /// flips it at runtime while `enabled`; the published image is unaffected
+    /// either way.
+    pub preview_effect: bool,
+    /// Lens falloff at the corners, `0.0..=1.0` (`1.0` = corners fully black).
+    pub vignette: f32,
+    /// Normalized radius where the darkening starts: `0.0` = at the centre,
+    /// `1.0` = at the image corners. Clamped to `0.0..=2.0`.
+    pub vignette_radius: f32,
+    /// How far past `vignette_radius` the falloff takes to reach full strength.
+    /// Smaller is a harder, more obviously artificial edge. Clamped to `0.0..=2.0`.
+    pub vignette_smoothness: f32,
+    /// Lateral chromatic aberration, as a fraction of the image the red and blue
+    /// channels are displaced by at the edges, clamped to `0.0..=0.02`. `0.005`
+    /// moves them about 4 px apart at the corners of a 1440-wide frame. Green is
+    /// never displaced, so the luminance an armour detector thresholds keeps its
+    /// geometry and only the colour fringes move.
+    pub chromatic_aberration: f32,
+    /// Radial distortion coefficient `k1` of the Brown-Conrady model, `-0.5..=0.5`
+    /// (positive = barrel, negative = pincushion).
+    ///
+    /// OFF BY DEFAULT ON PURPOSE: the published `/camera_info` describes an
+    /// undistorted pinhole (`d` is all zeros), so enabling this makes the image
+    /// and the intrinsics disagree and PnP's translation estimates drift by an
+    /// amount that grows towards the edges. Turn it on when the consumer is
+    /// expected to undistort for itself; leave it off when the goal is to test a
+    /// detector that trusts `camera_info`.
+    pub lens_distortion: f32,
+    /// Zoom applied after distortion, `1.0..=2.0`. Barrel distortion pushes the
+    /// frame's edge pixels outwards; zooming crops them back off. Never below 1.0:
+    /// that samples outside the rendered frame and smears the border.
+    pub lens_distortion_scale: f32,
+    /// Sensor grain, as a fraction of the local signal (`0.0..=0.25`), redrawn
+    /// every frame. This is multiplicative gain noise, so it vanishes in true
+    /// black rather than turning it grey. Set to `0.0` to switch the sensor off
+    /// and keep the lens: grain raises the entropy of every frame, which at
+    /// `[capture.color] jpeg_quality` costs image bytes and encode time.
+    pub grain: f32,
+}
+
+impl Default for CaptureEffectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            preview_effect: true,
+            vignette: 0.35,
+            vignette_radius: 0.75,
+            vignette_smoothness: 0.45,
+            chromatic_aberration: 0.005,
+            lens_distortion: 0.0,
+            lens_distortion_scale: 1.0,
+            grain: 0.05,
+        }
+    }
+}
+
+impl CaptureEffectConfig {
+    /// Vignette strength, clamped so a typo cannot black out the frame.
+    pub fn vignette(&self) -> f32 {
+        finite_or_zero(self.vignette).clamp(0.0, 1.0)
+    }
+
+    /// Vignette inner radius. Past `1.0` the corners are no longer dark.
+    pub fn vignette_radius(&self) -> f32 {
+        finite_or_zero(self.vignette_radius).clamp(0.0, 2.0)
+    }
+
+    /// Vignette falloff width.
+    pub fn vignette_smoothness(&self) -> f32 {
+        finite_or_zero(self.vignette_smoothness).clamp(0.0, 2.0)
+    }
+
+    /// Chromatic aberration. Above `0.02` the fringes are wider than any real
+    /// lens and eat the light bars the detector looks for.
+    pub fn chromatic_aberration(&self) -> f32 {
+        finite_or_zero(self.chromatic_aberration).clamp(0.0, 0.02)
+    }
+
+    /// Radial distortion coefficient.
+    pub fn lens_distortion(&self) -> f32 {
+        finite_or_zero(self.lens_distortion).clamp(-0.5, 0.5)
+    }
+
+    /// Distortion zoom. Below `1.0` the sampler would read outside the frame.
+    pub fn lens_distortion_scale(&self) -> f32 {
+        finite_or_one(self.lens_distortion_scale).clamp(1.0, 2.0)
+    }
+
+    /// Sensor grain amplitude.
+    pub fn grain(&self) -> f32 {
+        finite_or_zero(self.grain).clamp(0.0, 0.25)
+    }
+}
+
+/// `NaN`/infinite input means "no effect" rather than "undefined pixels".
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+/// Same, for the fields where `0` would be an invalid value rather than "off".
+fn finite_or_one(value: f32) -> f32 {
+    if value.is_finite() { value } else { 1.0 }
 }
 
 /// The color stream that a `--features ros2` build hands to the auto-aim stack.
@@ -922,6 +1057,63 @@ mod tests {
         assert!(
             color.publish_period().is_some(),
             "the shipped config rate limits the image stream"
+        );
+    }
+
+    #[test]
+    fn capture_effect_tolerates_missing_fields() {
+        // An older config.toml has no `[capture.effect]` section at all: the layer
+        // defaults to on, which is what the section is for.
+        let effect: CaptureEffectConfig =
+            toml::from_str("grain = 0.2\n").expect("partial [capture.effect]");
+
+        assert_eq!(effect.grain(), 0.2);
+        assert!(effect.enabled);
+        assert!(effect.preview_effect);
+        assert_eq!(
+            effect.lens_distortion(),
+            0.0,
+            "畸变默认关闭，否则 /camera_info 的零畸变假设立刻失效"
+        );
+    }
+
+    #[test]
+    fn capture_effect_is_clamped_into_a_visible_range() {
+        let extreme = CaptureEffectConfig {
+            vignette: f32::NAN,
+            vignette_radius: 99.0,
+            vignette_smoothness: -1.0,
+            chromatic_aberration: 9.0,
+            lens_distortion: -7.0,
+            lens_distortion_scale: 0.0,
+            grain: f32::INFINITY,
+            ..CaptureEffectConfig::default()
+        };
+
+        assert_eq!(extreme.vignette(), 0.0, "NaN 视为无效果");
+        assert_eq!(extreme.vignette_radius(), 2.0);
+        assert_eq!(extreme.vignette_smoothness(), 0.0);
+        assert_eq!(extreme.chromatic_aberration(), 0.02);
+        assert_eq!(extreme.lens_distortion(), -0.5);
+        assert_eq!(
+            extreme.lens_distortion_scale(),
+            1.0,
+            "小于 1 会把采样点推到画面外"
+        );
+        assert_eq!(extreme.grain(), 0.0, "非有限值不能变成全屏噪声");
+    }
+
+    #[test]
+    fn repository_config_ships_the_lens_on_and_distortion_off() {
+        let config = SimulationConfig::load().expect("config.toml 必须能解析");
+        let effect = &config.capture.effect;
+
+        assert!(effect.enabled, "出厂配置应带上模拟镜头");
+        assert!(effect.grain() > 0.0, "传感器噪点也要在");
+        assert_eq!(
+            effect.lens_distortion(),
+            0.0,
+            "出厂配置必须保持零畸变，PnP 才对得上 camera_info"
         );
     }
 }

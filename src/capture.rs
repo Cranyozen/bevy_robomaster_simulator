@@ -1,5 +1,6 @@
 pub mod depth;
 pub mod driver;
+pub mod effect;
 pub mod view_copy;
 
 use bevy::camera::RenderTarget;
@@ -37,6 +38,12 @@ pub fn setup_capture_camera(world: &mut World) {
 
     let render_target_handle = world.resource::<ImageHandle>().0.clone();
     let fov = world.resource::<CameraFov>().0;
+
+    // The clean copy of this view that the lens-simulation preview toggles to.
+    // Created here because it has to match the capture target's size and format
+    // exactly; see `effect::insert_raw_preview_target`.
+    effect::insert_raw_preview_target(world, &render_target_handle);
+
     let metalfx = world
         .get_resource::<SimulationConfig>()
         .filter(|config| cfg!(target_os = "macos") && config.render.metalfx_temporal)
@@ -105,6 +112,10 @@ pub fn setup_preview_window(world: &mut World) {
         query.iter(world).next().is_some()
     };
     if !preview_node_exists {
+        // Spawned with the capture image (the simulated camera, i.e. what ROS 2
+        // and Talos receive). `capture::effect::show_lens_preview` retargets this
+        // node to the clean copy while `F7` asks for it; the published image is
+        // never involved.
         world.spawn((
             Node {
                 width: Val::Percent(100.0),
