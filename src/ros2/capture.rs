@@ -16,11 +16,13 @@ use bevy::ecs::world::DeferredWorld;
 use bevy::prelude::*;
 use bevy::render::{RenderApp, RenderSystems};
 use r2r::Clock;
-use r2r::sensor_msgs::msg::{CameraInfo, RegionOfInterest};
+use r2r::sensor_msgs::msg::{CameraInfo, CompressedImage, RegionOfInterest};
 use r2r::std_msgs::msg::Header;
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,7 +86,7 @@ impl CaptureGates {
 
 /// Releases a capture slot when the frame is published — or dropped without ever
 /// reaching a worker.
-struct CaptureSlot(Arc<CaptureGates>);
+pub(crate) struct CaptureSlot(Arc<CaptureGates>);
 
 impl Drop for CaptureSlot {
     fn drop(&mut self) {
@@ -134,7 +136,8 @@ impl SnapshotAsync for RosSnapshot {
             return;
         }
 
-        // Kept alive for the whole body, then dropped with the slot.
+        // Kept alive for the whole body, then moved into the encode request (it
+        // is released when the frame is actually published, not before).
         let want_image = self.slot.is_some();
 
         let (width, height, data) = match rgb_resized(
@@ -163,23 +166,21 @@ impl SnapshotAsync for RosSnapshot {
         }
 
         if want_image {
-            if self.ctx.publish_raw {
-                self.ctx.image_raw.publish(raw_image(
-                    optical_frame_hdr.clone(),
-                    width,
-                    height,
-                    &data,
-                ));
-            }
-            if self.ctx.publish_compressed {
-                self.ctx.image_compressed.publish(compress_image(
-                    optical_frame_hdr,
-                    width,
-                    height,
-                    &data,
-                    self.ctx.jpeg_quality,
-                ));
-            }
+            // The encode happens on the pool, so this thread only pays for the
+            // copy that decouples the pixels from the recycled readback buffer
+            // (~0.4 ms for a full-resolution frame). The frame's messages are
+            // published by the pool's publisher thread, in capture order.
+            self.ctx.encode.submit(EncodeRequest {
+                seq: 0, // assigned by the pool, in submission order
+                header: optical_frame_hdr,
+                width,
+                height,
+                data: data.into_owned(),
+                want_raw: self.ctx.publish_raw,
+                want_compressed: self.ctx.publish_compressed,
+                jpeg_quality: self.ctx.jpeg_quality,
+                slot: self.slot.take(),
+            });
         }
     }
 }
@@ -226,6 +227,159 @@ impl GpuCaptureHandler for RosSnapshotCreator {
 #[derive(Resource, Clone, Deref, DerefMut)]
 pub struct RosCaptureContextShared(Arc<RosCaptureContext>);
 
+/// One captured frame on its way to the wire, handed to the encoder pool.
+struct EncodeRequest {
+    seq: u64,
+    header: Header,
+    width: u32,
+    height: u32,
+    /// Published-size `rgb8` pixels. Owned, not borrowed: the capture driver
+    /// recycles the readback buffer as soon as the snapshot returns, so anything
+    /// that outlives the callback has to carry its own copy.
+    data: Vec<u8>,
+    want_raw: bool,
+    want_compressed: bool,
+    jpeg_quality: u8,
+    /// Kept alive until the frame is published, so `max_in_flight` still bounds
+    /// the whole pipeline, not just the readback half of it.
+    slot: Option<CaptureSlot>,
+}
+
+/// An encoded frame waiting for its turn on the wire. `pub(crate)` fields: the
+/// pool hands these to the publisher closure, which the ROS plugin owns.
+pub(crate) struct EncodedFrame {
+    pub(crate) seq: u64,
+    pub(crate) raw: Option<r2r::sensor_msgs::msg::Image>,
+    pub(crate) compressed: Option<CompressedImage>,
+    pub(crate) slot: Option<CaptureSlot>,
+}
+
+/// Parallel JPEG encode with strictly ordered publication.
+///
+/// WHY: every stage of a captured frame used to run on the single
+/// `capture-readback` thread — map wait, BGRA->RGB repack, optional box
+/// downscale, JPEG encode, publish. The map wait is the only slow part that is
+/// *waiting* (it overlaps across slots), but `image`'s JPEG encoder is scalar
+/// (measured ~21 Mpix/s: ~47 ms for one 1440x1080 frame), so that one thread sat
+/// at 100% of a core and pinned the image rate at ~21 Hz while the render threads
+/// and the rest of the machine idled. Moving the encode onto a small pool lifts
+/// the ceiling to roughly `threads x` that; the detector then gets full-resolution
+/// frames at 30-40 Hz instead of half-resolution frames at the same rate.
+///
+/// WHY THE REORDER BUFFER: the detector hands header stamps to an EKF, so a frame
+/// that overtakes an older one injects a stale pose. Encoders finish out of order
+/// (that is the whole point), so results are buffered by sequence number and
+/// published in capture order. Sequence numbers are assigned by the single
+/// readback thread as it submits, so "capture order" is exact.
+///
+/// WHY A DEDICATED PUBLISHER THREAD: the reorder buffer cannot be drained from
+/// the capture callback. A frame holds its capture slot until it is published, so
+/// once `max_in_flight` frames are in the pool the capture side stops calling the
+/// callback — draining there would deadlock (measured: exactly the frames that
+/// filled the slots went unpublished, ~1 image/s). The publisher thread is the
+/// only place that both frees slots and is not gated by them.
+///
+/// Backpressure: the job channel is bounded by the capture-slot count, and a slot
+/// is held until its frame is published, so the pool can never run ahead of the
+/// in-flight budget.
+pub struct EncodePool {
+    jobs: SyncSender<EncodeRequest>,
+    next_seq: AtomicU64,
+}
+
+impl EncodePool {
+    /// Spawns `threads` encoders plus one ordered publisher.
+    pub fn new(
+        threads: usize,
+        capacity: usize,
+        publish: impl Fn(EncodedFrame) + Send + 'static,
+    ) -> Self {
+        let (jobs, job_rx) = std::sync::mpsc::sync_channel::<EncodeRequest>(capacity.max(1));
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<EncodedFrame>();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+
+        for index in 0..threads.max(1) {
+            let job_rx = job_rx.clone();
+            let result_tx = result_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("jpeg-encode-{index}"))
+                .spawn(move || encode_loop(job_rx, result_tx))
+                .expect("failed to spawn the jpeg encode thread");
+        }
+        drop(result_tx);
+
+        std::thread::Builder::new()
+            .name("ros-publish".to_string())
+            .spawn(move || publish_loop(result_rx, publish))
+            .expect("failed to spawn the ros publish thread");
+
+        Self {
+            jobs,
+            next_seq: AtomicU64::new(0),
+        }
+    }
+
+    /// Hands a frame to the pool, returning its sequence number. Blocks when the
+    /// encoders are behind — the pressure belongs on the capture side, which
+    /// still holds the slot, not on an unbounded queue.
+    fn submit(&self, mut request: EncodeRequest) -> u64 {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        request.seq = seq;
+        let _ = self.jobs.send(request);
+        seq
+    }
+}
+
+fn encode_loop(
+    jobs: Arc<Mutex<Receiver<EncodeRequest>>>,
+    results: std::sync::mpsc::Sender<EncodedFrame>,
+) {
+    loop {
+        // `recv` is serialized across the pool (mpsc has one queue), but the
+        // encode itself — the expensive part — runs outside the lock.
+        let job = { jobs.lock().unwrap().recv() };
+        let Ok(job) = job else { return };
+
+        let compressed = job.want_compressed.then(|| {
+            compress_image(
+                job.header.clone(),
+                job.width,
+                job.height,
+                &job.data,
+                job.jpeg_quality,
+            )
+        });
+        let raw = job
+            .want_raw
+            .then(|| raw_image_owned(job.header, job.width, job.height, job.data));
+
+        let frame = EncodedFrame {
+            seq: job.seq,
+            raw,
+            compressed,
+            slot: job.slot,
+        };
+        if results.send(frame).is_err() {
+            return;
+        }
+    }
+}
+
+/// Publishes results in capture order, never dropping one on the floor: a frame
+/// that arrives early waits here until its predecessors are out.
+fn publish_loop(results: Receiver<EncodedFrame>, publish: impl Fn(EncodedFrame)) {
+    let mut next = 0u64;
+    let mut buffered: BTreeMap<u64, EncodedFrame> = BTreeMap::new();
+
+    while let Ok(frame) = results.recv() {
+        buffered.insert(frame.seq, frame);
+        while let Some(frame) = buffered.remove(&next) {
+            publish(frame);
+            next += 1;
+        }
+    }
+}
+
 #[derive(Resource, Clone)]
 pub struct RosCaptureContext {
     pub clock: Arc<Mutex<Clock>>,
@@ -238,6 +392,9 @@ pub struct RosCaptureContext {
     /// is built from, so PnP sees consistent intrinsics either way.
     pub published_size: (u32, u32),
     pub gates: Arc<CaptureGates>,
+    /// JPEG encode + ordered publication. Shared, because the context is cloned
+    /// into the render world while there is still exactly one pool.
+    pub encode: Arc<EncodePool>,
     pub camera_info: TopicPublisher<CameraInfoTopic>,
     pub image_raw: TopicPublisher<ImageRawTopic>,
     pub image_compressed: TopicPublisher<ImageCompressedTopic>,
@@ -282,6 +439,18 @@ impl Plugin for RosCapturePlugin {
 }
 
 fn raw_image(hdr: Header, width: u32, height: u32, data: &[u8]) -> r2r::sensor_msgs::msg::Image {
+    raw_image_owned(hdr, width, height, Vec::from(data))
+}
+
+/// Same as [`raw_image`] but takes the pixels by value: on the encoder thread
+/// there is nobody left to share the buffer with, and `Vec::from` would be
+/// another 4.66 MB copy at full resolution.
+fn raw_image_owned(
+    hdr: Header,
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+) -> r2r::sensor_msgs::msg::Image {
     r2r::sensor_msgs::msg::Image {
         header: hdr,
         height,
@@ -289,7 +458,7 @@ fn raw_image(hdr: Header, width: u32, height: u32, data: &[u8]) -> r2r::sensor_m
         encoding: "rgb8".to_string(),
         is_bigendian: 0,
         step: width * 3,
-        data: Vec::from(data),
+        data,
     }
 }
 

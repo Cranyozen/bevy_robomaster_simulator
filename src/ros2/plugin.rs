@@ -6,7 +6,7 @@ use crate::components::{
 };
 use crate::config::SimulationConfig;
 use crate::robomaster::prelude::{ArmorRoot, PowerRune, RuneIndex, TechCore, tech_core_state_json};
-use crate::ros2::capture::{CaptureGates, RosCaptureContext, RosCapturePlugin};
+use crate::ros2::capture::{CaptureGates, EncodePool, RosCaptureContext, RosCapturePlugin};
 use crate::ros2::livox::{RosLivoxContext, RosLivoxPlugin};
 use crate::ros2::prelude::AverageRateLimiter;
 use crate::ros2::prelude::transform;
@@ -449,7 +449,7 @@ impl Plugin for ROS2Plugin {
                 _ => "/image_raw",
             };
             info!(
-                "[ROS2] color stream: {}x{} -> {}x{} on {} at {} (jpeg quality {})",
+                "[ROS2] color stream: {}x{} -> {}x{} on {} at {} (jpeg quality {}, {} encode threads)",
                 color_stream.width,
                 color_stream.height,
                 published_size.0,
@@ -457,6 +457,7 @@ impl Plugin for ROS2Plugin {
                 topics,
                 rate,
                 color_stream.jpeg_quality(),
+                color_stream.encode_threads(),
             );
         }
         let depth_capture_config = CaptureConfig {
@@ -486,6 +487,29 @@ impl Plugin for ROS2Plugin {
                         image_period,
                         camera_info_period,
                         color_stream.max_in_flight(),
+                    )),
+                    // The job channel is sized by the capture budget: a frame
+                    // holds its slot until it is published, so this many can be
+                    // in the pool at once and no more. The publisher thread owns
+                    // the topic handles and releases the slots.
+                    encode: Arc::new(EncodePool::new(
+                        color_stream.encode_threads(),
+                        color_stream.max_in_flight(),
+                        {
+                            let image_raw = image_raw.clone();
+                            let image_compressed = image_compressed.clone();
+                            move |frame| {
+                                if let Some(message) = frame.raw {
+                                    image_raw.publish(message);
+                                }
+                                if let Some(message) = frame.compressed {
+                                    image_compressed.publish(message);
+                                }
+                                // Dropping the slot here is what admits the next
+                                // capture.
+                                drop(frame.slot);
+                            }
+                        },
                     )),
                     camera_info,
                     image_raw,

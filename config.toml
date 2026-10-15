@@ -38,7 +38,17 @@ enabled = true
 
 [render]
 # Expensive on large scenes; disable for higher FPS.
-shadows = true
+#
+# MEASURED (2026-10, this machine, 1440x1080 capture + auto-aim stack): shadow
+# passes are what caps the render loop, and the render loop is what caps the
+# image rate. With the encoder already parallelised (`encode_threads`),
+# shadows on -> /image_raw/compressed 23 Hz and the closed loop sits at ~23 Hz;
+# shadows off -> 52-57 Hz images and a ~50 Hz closed loop. 1 shadow cascade with
+# shadow_max_distance = 30 costs the same as 4 cascades at 150 m, so the cost is
+# the shadow map pass itself, not the cascade count: turning them off is the only
+# lever that buys the full ~2.3x. Turn it back on if you would rather look at the
+# scene than hit 25 Hz.
+shadows = false
 # Main on-screen camera anti-aliasing.
 main_camera_fxaa = true
 # Enables Apple's MetalFX temporal scaler for color 3D cameras on macOS.
@@ -69,17 +79,29 @@ height = 1080
 
 # --- image transport budget (ROS 2 only) --------------------------------------
 # Measured on this machine (AMD iGPU). Control-loop rate = /detector/armors, i.e.
-# how often the detector actually gets a fresh frame:
+# how often the detector actually gets a fresh frame.
 #
+# Historical (before the encoder pool + `shadows = false`):
 #   raw  1440x1080, every frame     ->  6.9 Hz,   25 MB/s, sim 20 fps
 #   raw  1440x1080, 30 Hz, 3 deep   -> 11.1 Hz,   48 MB/s, sim 13 fps
-#   JPEG 1440x1080, 30 Hz, 3 deep   -> 12.0 Hz, 0.45 MB/s, sim ~60 fps   <- shipped
+#   JPEG 1440x1080, 30 Hz, 3 deep   -> 12.0 Hz, 0.45 MB/s, sim ~60 fps
 #   JPEG  720x540, 30 Hz, 3 deep    -> 15.9 Hz, 0.31 MB/s, sim 30 fps
 #
-# The binding constraints are the GPU readback (~100 ms per capture, which is why
-# `max_in_flight` matters) and `image`'s scalar JPEG encoder (~83 ms for a
-# full-resolution frame). DDS itself is not a limit: a synthetic publisher pushed
-# 221 MB/s through it.
+# 2026-10, with the fixes in this repo, all at 1440x1080 JPEG q60, 20 s windows:
+#   serial encode (~21 Mpix/s), shadows on      -> 23 Hz images, 23 Hz loop
+#   serial encode,              shadows off     -> 25 Hz images, 25 Hz loop
+#   3 encode threads,           shadows on      -> 23 Hz images, 23 Hz loop
+#   3 encode threads,           shadows off     -> 52 Hz images, 50 Hz loop
+#   4 encode threads, mif 6,    shadows off     -> 78 Hz images, 56 Hz loop (detector-limited)
+#
+# The three binding constraints, in the order they were found:
+#   1. the render loop, once shadows are on: it caps *captures*, and captures are
+#      what the image rate counts. `shadows = false` more than doubles it.
+#   2. the scalar JPEG encoder (~21 Mpix/s = ~47 ms/frame at 1440x1080) on the
+#      single capture-readback thread: `encode_threads` removes that wall.
+#   3. the GPU readback (~100 ms per capture, almost no CPU), which is what
+#      `max_in_flight` overlaps.
+# DDS itself is not a limit: a synthetic publisher pushed 221 MB/s through it.
 #
 # DO NOT LOWER `scale` WITHOUT RE-TESTING DETECTION. The 720x540 row looks better
 # on every axis until you check whether the armor detector still works: with the
@@ -93,12 +115,21 @@ height = 1080
 # Upper bound on the image publish rate, in Hz. 0 = every captured frame.
 # Frames that are skipped are dropped *before* the GPU readback, so they cost
 # nothing (no copy, no conversion, no encode).
-publish_hz = 30.0
+publish_hz = 0
 # How many captures may be in flight at once, 1..=8. A readback waits ~100 ms for
 # `map_async` to land on a later device poll while costing almost no CPU, so 1
 # slot caps the stream at ~6 Hz whatever else is set. 3 buys ~2x and costs up to
-# one frame of extra latency.
-max_in_flight = 3
+# one frame of extra latency. With the encode pool this is also the pool's queue
+# depth, so keep it >= encode_threads to keep every encoder fed.
+max_in_flight = 4
+# JPEG encode threads, 1..=8. `image`'s JPEG encoder is scalar (measured ~21 Mpix/s
+# here: ~47 ms for one 1440x1080 frame), so doing the whole frame inline on the
+# single capture-readback thread pinned the image rate at ~21 Hz while that thread
+# sat at 100% of one core and the rest of the machine idled. Encoding on N threads
+# lifts the ceiling to roughly N x that, at the cost of N-1 more cores' worth of
+# CPU while encoding. Frames are still *published* strictly in capture order (the
+# detector feeds header stamps to an EKF), so this changes throughput only.
+encode_threads = 3
 # Upper bound on the `/camera_info` publish rate, in Hz. The intrinsics only
 # change when the resolution does and the detector latches the first message.
 camera_info_hz = 1.0
@@ -110,10 +141,16 @@ publish_compressed = true
 # slows the gimbal PID, since that runs per rendered frame.
 publish_raw = false
 # JPEG quality, 1..=100. Lower is cheaper on the CPU and the wire.
-jpeg_quality = 80
+jpeg_quality = 60
 # Downscale before publishing, 0.1..=1.0. `/camera_info` is scaled to match, so
 # PnP stays correct, but the *detector* is what breaks first — see the warning
 # above. Keep 1.0 unless you have verified detection in your own scene.
+#
+# 0.6 was a workaround for the encoder ceiling, not a real speed-up: it bought Hz
+# by throwing away the resolution the detector needs (measured earlier: 120/130
+# frames with armours at 1.0 vs 0/130 at 0.5). With `encode_threads` + no shadows
+# the full-resolution stream runs faster than the half-resolution one used to, so
+# this is back at 1.0.
 scale = 1.0
 
 [capture.effect]
@@ -172,7 +209,7 @@ near = 0.1
 far = 80.0
 
 [livox_ros]
-enabled = true
+enabled = false
 frame_id = "camera_link"
 publish_freq = 10.0
 points_per_second = 400000
