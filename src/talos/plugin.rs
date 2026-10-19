@@ -177,11 +177,10 @@ pub fn recv_gimbal_cmd(subscriber: &ShmSubscriberRes) -> Option<GimbalCmd> {
     subscriber.0.lock().ok()?.recv_gimbal_cmd()
 }
 
-pub const M_ALIGN_MAT3: Mat3 = Mat3::from_cols(
-    Vec3::new(0.0, -1.0, 0.0), // M[0,0], M[1,0], M[2,0]
-    Vec3::new(0.0, 0.0, 1.0),  // M[0,1], M[1,1], M[2,1]
-    Vec3::new(-1.0, 0.0, 0.0), // M[0,2], M[1,2], M[2,2]
-);
+/// Bevy (Y-up) → ROS (Z-up) alignment. Single source of truth:
+/// [`crate::util::gt::ALIGN`], which the `/tf` writer and the benchmark ground
+/// truth also use.
+pub const M_ALIGN_MAT3: Mat3 = crate::util::gt::ALIGN;
 
 #[inline]
 pub fn to_ros(bevy_transform: Transform) -> Transform {

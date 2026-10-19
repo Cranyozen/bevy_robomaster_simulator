@@ -47,5 +47,12 @@ pub(super) struct ArmorCollisionPlugin;
 impl Plugin for ArmorCollisionPlugin {
     fn build(&self, app: &mut bevy::app::App) {
         app.add_observer(handle_armor_collision);
+        // Benchmark builds get a second observer over the same `CollisionEnd`
+        // event, which publishes the attributable `/sim/events/hit`. It is a
+        // separate observer rather than extra code in `handle_armor_collision`
+        // so the v1 path (statistics included) stays byte-identical; the two
+        // agree because they test the same condition.
+        #[cfg(feature = "bench")]
+        app.add_observer(crate::bench::events::handle_shot_end);
     }
 }

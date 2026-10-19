@@ -1,17 +1,64 @@
 use bevy::prelude::*;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use crate::components::{
-    ActiveSlapper, Controlled, Infantry, InfantryChassis, InfantryGimbal, SlapperInfantry,
-    SubscribeAutoAim,
+    ActiveSlapper, CameraMode, Controlled, FollowingType, Infantry, InfantryChassis, InfantryGimbal,
+    MotionSource, RobotId, ScenarioAbsent, SlapperInfantry, SubscribeAutoAim,
 };
 use crate::config::SimulationConfig;
 use crate::robomaster::vehicle::movement::VehicleDynamic;
-use crate::systems::ControllerState;
+use crate::systems::{ControllerInput, ControllerState};
 use avian3d::prelude::*;
 
 const CHASSIS_ROTATION_STOP_EPSILON: f32 = 1e-3;
 const CHASSIS_TILT_LIMIT: f32 = 20.0 * std::f32::consts::PI / 180.0;
+
+/// Per-robot chassis/gimbal input, keyed by [`RobotId`].
+///
+/// The interactive simulator only ever had two input slots
+/// (`ControllerState::controlled` and `::remote`) and handed them to two
+/// hardcoded *single* vehicles. A benchmark that drives several robots at once
+/// needs the mapping to be explicit, so input is routed here once per frame and
+/// the vehicle system reads it back by id. Two writers, one each:
+///
+/// - [`route_robot_inputs`] writes the keyboard/gamepad slots (`MotionSource`
+///   `Gamepad`),
+/// - the benchmark scenario evaluator (`src/bench/scenario.rs`) writes the
+///   `Scripted` robots.
+///
+/// An id with no entry is a robot nothing drives this frame — which is exactly
+/// what "no input authority" meant before this table existed.
+#[derive(Resource, Default)]
+pub struct RobotInputs {
+    inputs: HashMap<RobotId, ControllerInput>,
+}
+
+impl RobotInputs {
+    pub fn clear(&mut self) {
+        self.inputs.clear();
+    }
+
+    pub fn set(&mut self, id: RobotId, input: ControllerInput) {
+        self.inputs.insert(id, input);
+    }
+
+    pub fn get(&self, id: RobotId) -> Option<ControllerInput> {
+        self.inputs.get(&id).copied()
+    }
+
+    pub fn remove(&mut self, id: RobotId) -> Option<ControllerInput> {
+        self.inputs.remove(&id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inputs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inputs.is_empty()
+    }
+}
 
 fn update_chassis_rotation(
     chassis_transform: &mut Transform,
@@ -55,101 +102,172 @@ fn move_towards(current: f32, target: f32, max_delta: f32) -> f32 {
     current + (target - current).clamp(-max_delta, max_delta)
 }
 
-pub fn vehicle_controls(
-    time: Res<Time>,
+/// Route the keyboard/gamepad slots into the per-robot table.
+///
+/// This is the whole of the old `ControllerState::controlled` /
+/// `ControllerState::remote` split, kept in one pure mapping so the "same
+/// controls, same robot" property can be unit-tested:
+///
+/// - `Controlled`    -> the primary keyboard/gamepad input (WASD + arrows),
+/// - `ActiveSlapper` -> the IJKL/d-pad "remote" input (the *second* vehicle the
+///   keyboard can drive),
+/// - neither         -> no input authority at all. Such a robot is a prop as far
+///   as input is concerned, exactly as before: an id with no table entry is not
+///   touched by [`robot_vehicle_controls`].
+///
+/// `Scripted` robots are left out on purpose — the benchmark scenario evaluator
+/// owns those.
+pub fn route_robot_inputs(
+    mut robot_inputs: ResMut<RobotInputs>,
     controller: Res<ControllerState>,
-    config: Res<SimulationConfig>,
-    infantry: Single<(Forces, &Mass, &mut VehicleDynamic), (With<Infantry>, With<Controlled>)>,
-    gimbal: Single<
-        (&GlobalTransform, &InfantryGimbal),
-        (With<Controlled>, Without<InfantryChassis>),
-    >,
-    chassis: Single<
-        (&mut Transform, &mut InfantryChassis),
+    robots: Query<
         (
-            With<Controlled>,
-            Without<InfantryGimbal>,
-            With<InfantryChassis>,
-            Without<Infantry>,
+            &RobotId,
+            Option<&MotionSource>,
+            Option<&Controlled>,
+            Option<&ActiveSlapper>,
         ),
+        (With<Infantry>, Without<ScenarioAbsent>),
     >,
 ) {
-    let controller = controller.controlled;
-    let input = controller.movement;
-    let boost = controller.boost_multiplier();
-
-    let (mut forces, &Mass(mass), mut dynamic) = infantry.into_inner();
-
-    let dt = time.delta_secs();
-    dynamic.linear(
-        &mut forces,
-        mass,
-        gimbal.into_inner().0,
-        input,
-        time.delta_secs(),
-        boost,
-    );
-
-    let (mut chassis_transform, mut chassis_data) = chassis.into_inner();
-    update_chassis_rotation(
-        &mut chassis_transform,
-        &mut chassis_data,
-        controller.chassis_yaw,
-        controller.chassis_roll,
-        controller.chassis_pitch,
-        config.vehicle.rotation_speed,
-        config.vehicle.yaw_acceleration,
-        config.vehicle.tilt_rotation_speed,
-        dt,
-    );
+    robot_inputs.clear();
+    for (id, source, controlled, active_slapper) in &robots {
+        if source.is_some_and(|source| source.is_scripted()) {
+            continue;
+        }
+        if let Some(input) = gamepad_input_for(
+            controlled.is_some(),
+            active_slapper.is_some(),
+            &controller,
+        ) {
+            robot_inputs.set(*id, input);
+        }
+    }
 }
 
-pub fn remote_vehicle_controls(
+/// Which of the two hand-driven slots a robot gets, if any.
+fn gamepad_input_for(
+    controlled: bool,
+    active_slapper: bool,
+    controller: &ControllerState,
+) -> Option<ControllerInput> {
+    if controlled {
+        Some(controller.controlled)
+    } else if active_slapper {
+        Some(controller.remote)
+    } else {
+        None
+    }
+}
+
+/// Drives every robot from the per-robot input table.
+///
+/// This replaces the pair of `Single<..>` systems (`vehicle_controls` and
+/// `remote_vehicle_controls`) that could only ever drive one vehicle each. The
+/// physics is unchanged — the same [`VehicleDynamic::linear`] and the same
+/// [`update_chassis_rotation`] — and so is the choice of movement frame:
+///
+/// - the ego (`Controlled`) moves relative to its **gimbal** (the auto-aim view
+///   direction), which is what `vehicle_controls` always did,
+/// - every other robot moves relative to its own **body**,
+/// - a **scripted** ego (`MotionSource::Scripted`, P1 `ego_move`) moves relative
+///   to its **body** as well: a scenario leg says "cross the line at 338°", and
+///   in the gimbal frame that direction would turn with the turret while the
+///   auto-aim tracks a target. A hand-driven ego never has a `MotionSource`, so
+///   the interactive behaviour is untouched.
+/// - the ego is released while the free camera is active, which used to be a
+///   `run_if` on `vehicle_controls` and is now a per-robot skip so the other
+///   vehicles keep being driven.
+///
+/// A robot whose id is absent from [`RobotInputs`] is skipped entirely — not
+/// driven with zero input — so an untouched robot's `Transform` is never
+/// rewritten by the Euler reconstruction inside `update_chassis_rotation`.
+pub fn robot_vehicle_controls(
     time: Res<Time>,
-    controller: Res<ControllerState>,
     config: Res<SimulationConfig>,
-    infantry: Single<
-        (&GlobalTransform, Forces, &Mass, &mut VehicleDynamic),
-        (With<ActiveSlapper>, With<Infantry>, Without<Controlled>),
-    >,
-    chassis: Single<
-        (&mut Transform, &mut InfantryChassis),
+    robot_inputs: Res<RobotInputs>,
+    camera_mode: Res<CameraMode>,
+    mut robots: Query<
         (
-            With<ActiveSlapper>,
-            With<InfantryChassis>,
-            Without<InfantryGimbal>,
-            Without<Infantry>,
+            Entity,
+            &RobotId,
+            Forces,
+            &Mass,
+            &mut VehicleDynamic,
+            &GlobalTransform,
+            Option<&Controlled>,
+            Option<&MotionSource>,
         ),
+        (With<Infantry>, Without<ScenarioAbsent>),
     >,
+    gimbals: Query<&GlobalTransform, With<InfantryGimbal>>,
+    mut chassis: Query<(&mut Transform, &mut InfantryChassis)>,
+    children: Query<&Children>,
 ) {
-    let controller = controller.remote;
-    let input = controller.movement;
-    let boost = controller.boost_multiplier();
-
-    let (infantry_global_transform, mut forces, &Mass(mass), mut dynamic) = infantry.into_inner();
-
+    let free_camera = camera_mode.0 == FollowingType::Free;
     let dt = time.delta_secs();
-    dynamic.linear(
-        &mut forces,
-        mass,
-        infantry_global_transform,
-        input,
-        time.delta_secs(),
-        boost,
-    );
 
-    let (mut chassis_transform, mut chassis_data) = chassis.into_inner();
-    update_chassis_rotation(
-        &mut chassis_transform,
-        &mut chassis_data,
-        controller.chassis_yaw,
-        controller.chassis_roll,
-        controller.chassis_pitch,
-        config.vehicle.rotation_speed,
-        config.vehicle.yaw_acceleration,
-        config.vehicle.tilt_rotation_speed,
-        dt,
-    );
+    for (root, id, mut forces, &Mass(mass), mut dynamic, root_transform, controlled, source) in
+        &mut robots
+    {
+        let Some(input) = robot_inputs.get(*id) else {
+            continue;
+        };
+        let is_ego = controlled.is_some();
+        let is_scripted = source.is_some_and(|source| source.is_scripted());
+        // The free camera releases the *player's* vehicle; a scripted ego has no
+        // player, so the scenario keeps owning it.
+        if is_ego && free_camera && !is_scripted {
+            continue;
+        }
+
+        let movement_frame = if is_ego && !is_scripted {
+            first_descendant_with(root, &children, |entity| gimbals.contains(entity))
+                .and_then(|entity| gimbals.get(entity).ok())
+                .unwrap_or(root_transform)
+        } else {
+            root_transform
+        };
+
+        let boost = input.boost_multiplier();
+        dynamic.linear(
+            &mut forces,
+            mass,
+            movement_frame,
+            input.movement,
+            dt,
+            boost,
+        );
+
+        let Some(chassis_entity) =
+            first_descendant_with(root, &children, |entity| chassis.contains(entity))
+        else {
+            continue;
+        };
+        let Ok((mut chassis_transform, mut chassis_data)) = chassis.get_mut(chassis_entity) else {
+            continue;
+        };
+        update_chassis_rotation(
+            &mut chassis_transform,
+            &mut chassis_data,
+            input.chassis_yaw,
+            input.chassis_roll,
+            input.chassis_pitch,
+            config.vehicle.rotation_speed,
+            config.vehicle.yaw_acceleration,
+            config.vehicle.tilt_rotation_speed,
+            dt,
+        );
+    }
+}
+
+/// First descendant of `root` (excluding `root` itself) accepted by `matches`.
+fn first_descendant_with(
+    root: Entity,
+    children: &Query<&Children>,
+    matches: impl Fn(Entity) -> bool,
+) -> Option<Entity> {
+    children.iter_descendants(root).find(|entity| matches(*entity))
 }
 
 pub fn gimbal_controls(
@@ -260,6 +378,54 @@ pub fn switch_slapper_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gamepad_routing_matches_the_old_two_slots() {
+        let mut controller = ControllerState::default();
+        controller.controlled.movement = Vec2::new(1.0, 0.0);
+        controller.remote.movement = Vec2::new(-1.0, 0.0);
+
+        // The ego gets what WASD/left-stick produce.
+        assert_eq!(
+            gamepad_input_for(true, false, &controller).unwrap().movement,
+            Vec2::new(1.0, 0.0)
+        );
+        // The remote vehicle gets what IJKL/d-pad produce.
+        assert_eq!(
+            gamepad_input_for(false, true, &controller).unwrap().movement,
+            Vec2::new(-1.0, 0.0)
+        );
+        // Both markers: the primary slot wins, and the old
+        // `remote_vehicle_controls` excluded `Controlled` anyway, so such a robot
+        // could never be driven twice — the new routing keeps that.
+        assert_eq!(
+            gamepad_input_for(true, true, &controller).unwrap().movement,
+            Vec2::new(1.0, 0.0)
+        );
+        // Neither: no input authority. The old systems never touched such a robot.
+        assert!(gamepad_input_for(false, false, &controller).is_none());
+    }
+
+    #[test]
+    fn robot_inputs_table_is_keyed_by_robot_id() {
+        let mut inputs = RobotInputs::default();
+        inputs.set(
+            RobotId(2),
+            ControllerInput {
+                chassis_yaw: 1.0,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(inputs.get(RobotId(2)).unwrap().chassis_yaw, 1.0);
+        assert!(
+            inputs.get(RobotId(1)).is_none(),
+            "an absent id means \"nothing drives this robot\""
+        );
+
+        inputs.clear();
+        assert!(inputs.is_empty());
+    }
 
     #[test]
     fn chassis_rotation_smoothly_ramps_towards_target_speed() {

@@ -51,6 +51,11 @@ enabled = true
 shadows = false
 # Main on-screen camera anti-aliasing.
 main_camera_fxaa = true
+# MSAA for the *capture* camera (the one whose image is published). 0/1 = off
+# (shipped), 2/4/8 = Msaa::Sample2/4/8. Only the capture camera is affected.
+# Exists so the detection-envelope experiment can move exactly one link setting
+# at a time (this one, jpeg_quality, grain) — see NOTES.md "检出包线分离实验".
+capture_msaa = 0
 # Enables Apple's MetalFX temporal scaler for color 3D cameras on macOS.
 metalfx_temporal = true
 # Enables MetalFX frame interpolation after temporal upscaling.
@@ -296,3 +301,30 @@ pip_margin = 16.0               # px - distance from the bottom-right corner
 pip_opacity = 0.8               # 0.0..=1.0 - inset opacity
 pip_refresh_divisor = 2         # render the inset every N frames (1 = every frame)
 pip_far = 60.0                  # m - inset camera far plane (culls distant scenery)
+
+[bench]
+# Benchmark v2 (`--features bench`). `enabled = false` is the shipped value: the
+# benchmark systems are compiled in but idle, so an ordinary simulator run is
+# unaffected. A benchmark run flips this on and points `scenario_path` at one
+# scenario file (see tools/benchmark/scenarios/). The runner rewrites both keys
+# per case with a line-level override, which is why the scenario path is a scalar
+# here and the scenario itself is a separate file.
+enabled = false
+# Scenario TOML to execute. The container mounts tools/benchmark/scenarios at
+# /scenarios; an empty string means "no scenario".
+scenario_path = "/scenarios/smoke_static.toml"
+# Publish rate of /sim/gt/robots, in Hz. Contract default is 50 Hz
+# (IMPLEMENTATION_PLAN.md §3.3); 0 publishes every frame.
+gt_robots_hz = 50.0
+# Close an explicit velocity loop on the scripted robots so a scenario's `v` is a
+# real target speed. The shared vehicle model is a direction actuator (it
+# normalises the stick), so without this `line v=1` and `line v=6` move at the
+# same speed. Bench-only: the keyboard/gamepad path is untouched. `false`
+# restores the raw open-loop stick, for A/B runs.
+speed_servo = true
+# Attribution radius for `hit_armor` events, in metres. A hit is attributed to
+# the plate whose centre is closest to the sweep-recovered `contact_point`,
+# instead of the collider avian reports: the speculative collision can start on
+# a neighbouring plate ~0.2 m early. Farther than this, the event falls back to
+# the collider's plate and logs `[bench][hitid]`. See src/config.rs.
+hit_armor_id_max_offset_m = 0.25

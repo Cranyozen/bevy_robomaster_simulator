@@ -2,7 +2,8 @@ use crate::arc_mutex;
 use crate::capture::CaptureSource;
 use crate::capture::driver::{CaptureConfig, CapturedFrameKind};
 use crate::components::{
-    Controlled, InfantryChassis, InfantryGimbal, InfantryLaunchOffset, SubscribeAutoAim,
+    Controlled, InfantryChassis, InfantryGimbal, InfantryLaunchOffset, ProjectileCooldown,
+    ScenarioAbsent, SubscribeAutoAim,
 };
 use crate::config::SimulationConfig;
 use crate::robomaster::prelude::{ArmorRoot, PowerRune, RuneIndex, TechCore, tech_core_state_json};
@@ -11,6 +12,7 @@ use crate::ros2::livox::{RosLivoxContext, RosLivoxPlugin};
 use crate::ros2::prelude::AverageRateLimiter;
 use crate::ros2::prelude::transform;
 use crate::ros2::topic::*;
+use crate::statistic::ProjectileStatistics;
 use crate::systems::{GimbalAimTarget, GimbalAimTracker, projectile_launch};
 use crate::util::entity_query::HierarchyQuery;
 use bevy::ecs::system::RunSystemOnce;
@@ -48,8 +50,44 @@ struct SpinThreadHandle(Option<JoinHandle<()>>);
 #[derive(Resource, Deref, DerefMut)]
 pub struct RoboMasterClock(pub Arc<Mutex<Clock>>);
 
+/// The wall-clock instant `/tf` was built at, for the current frame.
+///
+/// `capture_rune` is the one system that samples [`RoboMasterClock`], and it
+/// stores the value it stamped `/tf` with here. The benchmark ground-truth
+/// publishers reuse this exact value instead of reading the clock again, so a
+/// GT message and the TF frame describing the *same world state* carry bitwise
+/// equal stamps (`IMPLEMENTATION_PLAN.md` §3.4.1) — which is what turns
+/// "GT vs `/tf armor_<N>`" into a real cross-check.
+#[derive(Resource, Clone)]
+pub struct RosFrameStamp(pub r2r::builtin_interfaces::msg::Time);
+
+/// Set the first time a solver solution arrives on `/rm_gimbal/cmd`.
+///
+/// A benchmark scenario with `trigger = "on_first_gimbal_cmd"` uses this as its
+/// `t_scenario = 0`, i.e. the moment the auto-aim stack is actually alive (the
+/// same t0 v1 used). `distance == -1.0` means "no solution", so it does not
+/// count: the clock must not start on a frame where nothing was solved.
+#[derive(Resource, Default)]
+pub struct FirstGimbalCmd(pub AtomicBool);
+
+impl FirstGimbalCmd {
+    pub fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn seen(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Resource, Deref, DerefMut)]
-struct FireRateLimiter(AverageRateLimiter);
+pub(crate) struct FireRateLimiter(AverageRateLimiter);
+
+/// Firing cadence the ROS command path allows.
+///
+/// Shared with `bench::services` so a runtime scenario reset restores exactly the
+/// cadence the node was built with instead of duplicating the number.
+pub(crate) const FIRE_RATE_HZ: f32 = 10.0;
 
 #[derive(Resource, Deref, DerefMut)]
 struct TechCoreStateRateLimiter(AverageRateLimiter);
@@ -115,7 +153,7 @@ macro_rules! tf_tree {
     (@frame $tf_vec:ident, $stamp:ident, $parent:ident, $current:ident, $(;)? $(,)? $({})?) => { };
 }
 
-fn capture_rune(
+pub(crate) fn capture_rune(
     camera: Single<&GlobalTransform, With<CaptureSource>>,
     gimbal: Single<&GlobalTransform, (With<Controlled>, With<InfantryGimbal>)>,
     muzzle_offset: Single<
@@ -134,9 +172,15 @@ fn capture_rune(
     camera_pose_pub: ResMut<TopicPublisher<CameraPoseTopic>>,
     center: Query<(Entity, &GlobalTransform)>,
     qq: HierarchyQuery,
-    armor: Query<(Entity, &GlobalTransform, &ArmorRoot)>,
+    armor: Query<(Entity, &GlobalTransform, &ArmorRoot), Without<ScenarioAbsent>>,
     marker_pub: ResMut<TopicPublisher<OutpostMarkerTopic>>,
+    mut frame_stamp: ResMut<RosFrameStamp>,
 ) {
+    // One clock read for the whole frame: `/tf`, the armour marker and the
+    // benchmark ground truth all describe this same instant.
+    let stamp = Clock::to_builtin_time(&res_unwrap!(clock).get_now().unwrap());
+    frame_stamp.0 = stamp.clone();
+
     let cam_transform = camera.into_inner();
     let gimbal = gimbal.into_inner();
     let cam_rel = cam_transform.reparented_to(gimbal);
@@ -210,7 +254,7 @@ fn capture_rune(
     };
 
     let transform_stamped = tf_tree! {
-        stamp: Clock::to_builtin_time(&res_unwrap!(clock).get_now().unwrap());
+        stamp: stamp.clone();
 
         "map" {
             "odom" as (gimbal.translation(), Quat::IDENTITY) for odom_pose_pub {
@@ -242,7 +286,6 @@ fn capture_rune(
         }
     };
 
-    let stamp = Clock::to_builtin_time(&res_unwrap!(clock).get_now().unwrap());
     for (entity, armor_root_tf, armor) in armor {
         let mut tff = armor_center(entity, armor_root_tf);
         tff.rotation =
@@ -299,11 +342,55 @@ fn capture_rune(
     });
 }
 
+/// A commanded fire stays latched until a shot actually leaves the barrel.
+///
+/// **A refused attempt must never consume the pulse**: the latch is cleared only by
+/// a real launch (`ProjectileStatistics::launch_count` growth), never by the
+/// attempt itself.
+///
+/// `/rm_gimbal/cmd` reports intent, not a guarantee: an attempt can be refused by
+/// the 10 Hz [`FireRateLimiter`] or by `ProjectileCooldown`, and the cooldown only
+/// advances while `projectile_launch` is running, so it lags a burst. Each attempt
+/// costs one rate-limiter ticket, which is why draining a burst takes a few frames.
+/// Consuming the request with the attempt itself let a refusal eat the commanded
+/// pulse (measured on the bench: 17 commanded pulses produced 2 shots). Latching it
+/// — and clearing it only once [`ProjectileStatistics::launch_count`] has grown
+/// past the value seen when the request was made — keeps every pulse while the
+/// limiter still bounds the cadence at ~10 Hz.
+#[derive(Resource, Default)]
+pub(crate) struct PendingFire {
+    requested: bool,
+    /// `launch_count` at the moment the request was latched, so a launch that
+    /// happened *before* the request cannot satisfy it.
+    launches_at_request: u32,
+    /// Attempts spent on the current request; the cooldown drains in a couple of
+    /// attempts, so a much larger count means the attempt never launches (e.g. the
+    /// fire path was disabled) and retrying would only burn limiter tickets.
+    attempts: u32,
+}
+
+impl PendingFire {
+    /// P1-B: drop a latched request, so a scenario reset cannot replay a pulse
+    /// that was commanded before the reset.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Retries per commanded pulse: at 10 Hz each attempt costs ~0.1 s, and the
+/// projectile cooldown (0.05 s of accumulated frame time) is satisfied after a
+/// couple of attempts.
+const MAX_FIRE_ATTEMPTS: u32 = 10;
+
 fn process_subscription(
     time: Res<Time>,
     mut commands: Commands,
     gimbal_cmd: ResMut<TopicSubscriber<GimbalCmdTopic>>,
+    first_cmd: Res<FirstGimbalCmd>,
     mut fire_rate_limiter: ResMut<FireRateLimiter>,
+    mut pending_fire: ResMut<PendingFire>,
+    mut cooldown: ResMut<ProjectileCooldown>,
+    statistics: Res<ProjectileStatistics>,
     gimbal: Single<
         (Entity, Option<&mut GimbalAimTracker>),
         (
@@ -316,21 +403,31 @@ fn process_subscription(
 ) {
     let (gimbal_entity, mut tracker) = gimbal.into_inner();
     fire_rate_limiter.tick(time.delta());
+
+    // A launch after the request was latched means the shot is out: stop retrying.
+    if pending_fire.requested && statistics.launch_count > pending_fire.launches_at_request {
+        pending_fire.requested = false;
+    }
+
+    // Drain everything that arrived since the last frame, newest state last: the
+    // queue keeps a whole `fire_advice` pulse instead of replacing it with the
+    // next message (see `TopicSubscriber`).
     loop {
         let Some(cmd) = gimbal_cmd.try_recv() else {
-            return;
+            break;
         };
         // No solution from the solver: drop the target so the PID loop stops driving.
+        // The latched request survives: a brief `distance == -1` is a state update,
+        // not a cancellation of an order the solver itself just issued.
         if cmd.distance == -1.0 {
             commands.entity(gimbal_entity).remove::<GimbalAimTracker>();
-            return;
+            break;
         }
-        if cmd.fire_advice {
-            if fire_rate_limiter.allow() {
-                commands.queue(|w: &mut World| {
-                    w.run_system_once(projectile_launch).unwrap();
-                });
-            }
+        first_cmd.mark();
+        if cmd.fire_advice && !pending_fire.requested {
+            pending_fire.requested = true;
+            pending_fire.launches_at_request = statistics.launch_count;
+            pending_fire.attempts = 0;
         }
 
         let target = GimbalAimTarget::from_solver_degrees(cmd.yaw as f32, cmd.pitch as f32);
@@ -341,6 +438,31 @@ fn process_subscription(
                     .entity(gimbal_entity)
                     .insert(GimbalAimTracker::new(target));
             }
+        }
+    }
+
+    // `ProjectileCooldown` only advances while `projectile_launch` runs, so on the
+    // ROS path (sparse attempts) it measured attempts instead of time: measured, a
+    // 17-pulse burst realized ~2 shots at ~1.7 Hz although the limiter allows 10 Hz
+    // and the cooldown is 0.05 s. Advance it with frame time while a request is
+    // pending. The Gamepad path is untouched — it has no request, so nothing ticks
+    // the cooldown here and its own per-frame call keeps its cadence — and the
+    // limiter below stays the binding gate, so the <=10 Hz contract is unchanged.
+    if pending_fire.requested {
+        cooldown.tick(time.delta());
+    }
+
+    // Service the latched request: one attempt per rate-limiter ticket. A refused
+    // attempt (no ticket this frame) does not lose the pulse, because the request is
+    // only cleared once a launch is observed.
+    if pending_fire.requested && fire_rate_limiter.allow() {
+        pending_fire.attempts += 1;
+        if pending_fire.attempts > MAX_FIRE_ATTEMPTS {
+            pending_fire.requested = false;
+        } else {
+            commands.queue(|w: &mut World| {
+                w.run_system_once(projectile_launch).unwrap();
+            });
         }
     }
 }
@@ -400,6 +522,19 @@ impl Plugin for ROS2Plugin {
 
         register_pub(signal_arc.clone(), app, &mut node);
         register_sub(signal_arc.clone(), app, &mut node);
+
+        // Benchmark v2, P1-B: `/sim/scenario/{load,start,reset}`. Same reason as
+        // the bench topics below — the DDS node lives here, and the service
+        // listener threads only enqueue (`poll_scenario_services` does the work
+        // inside the Bevy schedule).
+        #[cfg(feature = "bench")]
+        crate::bench::services::register_services(signal_arc.clone(), app, &mut node);
+
+        // Benchmark v2 topics. Registered here rather than in `BenchPlugin`
+        // because this is where the DDS node lives; `BenchPlugin` (added after
+        // this plugin) only consumes the publisher resources.
+        #[cfg(feature = "bench")]
+        crate::ros2::topic::bench_topics::register_pub(signal_arc.clone(), app, &mut node);
 
         let camera_info = app
             .world_mut()
@@ -471,8 +606,14 @@ impl Plugin for ROS2Plugin {
             ((sim_config.livox_ros.points_per_second as f32) / publish_freq).max(1.0) as usize;
 
         app.insert_resource(RoboMasterClock(clock.clone()))
+            .insert_resource(RosFrameStamp(r2r::builtin_interfaces::msg::Time {
+                sec: 0,
+                nanosec: 0,
+            }))
+            .insert_resource(FirstGimbalCmd::default())
             .insert_resource(StopSignal(signal_arc.clone()))
-            .insert_resource(FireRateLimiter(AverageRateLimiter::from_hz(10.0)))
+            .insert_resource(FireRateLimiter(AverageRateLimiter::from_hz(FIRE_RATE_HZ)))
+            .init_resource::<PendingFire>()
             .insert_resource(TechCoreStateRateLimiter(AverageRateLimiter::from_hz(20.0)))
             .add_plugins(RosCapturePlugin {
                 config: color_capture_config,

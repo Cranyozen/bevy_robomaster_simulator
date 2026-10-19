@@ -1,4 +1,4 @@
-use bevy::math::{Mat3, Quat, Vec3};
+use bevy::math::{Mat3, Quat};
 use bevy::prelude::Transform;
 use std::time::{Duration, Instant};
 
@@ -89,11 +89,10 @@ impl WallRateLimiter {
     }
 }
 
-pub const M_ALIGN_MAT3: Mat3 = Mat3::from_cols(
-    Vec3::new(0.0, -1.0, 0.0), // M[0,0], M[1,0], M[2,0]
-    Vec3::new(0.0, 0.0, 1.0),  // M[0,1], M[1,1], M[2,1]
-    Vec3::new(-1.0, 0.0, 0.0), // M[0,2], M[1,2], M[2,2]
-);
+/// Bevy (Y-up) → ROS (Z-up) alignment. Single source of truth:
+/// [`crate::util::gt::ALIGN`]. The benchmark cross-checks `/sim/gt/*` against
+/// these very transforms at millimetre scale, so the two must never drift.
+pub const M_ALIGN_MAT3: Mat3 = crate::util::gt::ALIGN;
 
 #[inline]
 pub fn transform(bevy_transform: Transform) -> r2r::geometry_msgs::msg::Transform {

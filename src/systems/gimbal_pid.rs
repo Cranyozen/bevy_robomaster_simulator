@@ -11,7 +11,22 @@ pub struct GimbalAimTarget {
 }
 
 impl GimbalAimTarget {
-    /// Solver commands arrive in degrees with pitch measured from the vertical axis.
+    /// Solver commands arrive in degrees:
+    ///
+    /// - `yaw_deg` is the muzzle azimuth in the **map frame** (degrees),
+    /// - `pitch_deg` is the elevation above the **horizon** (degrees,
+    ///   **negative = downwards**).
+    ///
+    /// This convention is verified against the benchmark stack: a command of
+    /// `-0.5` produces a projectile launch elevation of `-0.5°` (measured from
+    /// the `/sim/events/fire` velocity vector), and the shipped
+    /// `hit_static_single` recordings send `pitch ∈ [-5.0, -3.0]` while their
+    /// shots leave at `-3.05°`. The `- 90.0` below folds in the gimbal
+    /// **mount** rest pitch; it is *not* part of the API convention.
+    ///
+    /// (An earlier version of this comment claimed "pitch measured from the
+    /// vertical axis". That is wrong: following it makes the gimbal saturate
+    /// against `gimbal_pitch_limit` and fires ~70° upwards.)
     pub fn from_solver_degrees(yaw_deg: f32, pitch_deg: f32) -> Self {
         Self {
             yaw: yaw_deg.to_radians(),

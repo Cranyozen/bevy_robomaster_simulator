@@ -1,0 +1,25 @@
+# Benchmark v2, P1-B: start the loaded scenario from `t_scenario = 0`.
+#
+# Contract (frozen):
+#  * An explicit start overrides the scenario file's `trigger`. When no service is
+#    ever called, the `trigger` path behaves exactly as it did before P1-B landed
+#    (backward compatible).
+#  * A start is a **full reset first**, then `phase=1` at `t_scenario = 0`: the
+#    same reset `/sim/scenario/reset` performs (vehicle poses/velocities/chassis
+#    yaw, scripted drivers, live projectiles, shot and event state, deviation
+#    metrics, fire-path limiters), so `load -> start` and a repeated `start` both
+#    begin from a clean run.
+#  * Replies within ~1 s without waiting for spawn; poll `/sim/scenario/status` for
+#    `spawn_applied` / `spawn_error`.
+#  * With no scenario loaded the reply is `success=false` with the reason, and
+#    `phase=0`.
+#  * Same-process constraint: a start begins a NEW run, so `shot_seq` restarts at
+#    1 and `sim_time_ns` restarts at 0 (it is the scenario clock). See
+#    `SimScenarioReset.srv` for the full note.
+
+---
+bool success
+string message
+string scenario_id
+uint8 phase            # 1 running after a successful start
+bool spawn_applied     # current value at reply time; poll status for the settled one

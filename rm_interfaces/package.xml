@@ -14,6 +14,10 @@
   <member_of_group>rosidl_interface_packages</member_of_group>
 
   <depend>geometry_msgs</depend>
+  <!-- CMakeLists.txt already lists std_msgs in rosidl DEPENDENCIES (the Sim*
+       messages carry a std_msgs/Header); declare it here too so the manifest and
+       the build agree. -->
+  <depend>std_msgs</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

@@ -16,7 +16,8 @@ use bevy::world_serialization::{InstanceId, WorldAssetRoot, WorldInstance};
 use std::collections::HashMap;
 
 use crate::components::{
-    ActiveSlapper, Controlled, GameLayer, GroundRoot, Infantry, PreciousCollision, SlapperInfantry,
+    ActiveSlapper, Controlled, GameLayer, GroundRoot, Infantry, PreciousCollision, RobotId,
+    SlapperInfantry,
 };
 use crate::robomaster::power_rune::construct::setup_power_rune;
 use crate::robomaster::prelude::{
@@ -199,6 +200,7 @@ async fn load_scene(w: AsyncWorld) {
                 )),
                 Infantry::new(Team::Red, INFANTRY_THREE_CONFIG),
                 Controlled,
+                RobotId(0),
             ),
         )
         .await;
@@ -211,6 +213,7 @@ async fn load_scene(w: AsyncWorld) {
                 Transform::from_xyz(1.0, 1.0, 1.0),
                 Infantry::new(Team::Blue, INFANTRY_THREE_CONFIG),
                 SlapperInfantry,
+                RobotId(1),
             ),
         )
         .await;
@@ -224,6 +227,7 @@ async fn load_scene(w: AsyncWorld) {
                 Infantry::new(Team::Blue, HERO_ROBOT_CONFIG),
                 SlapperInfantry,
                 ActiveSlapper,
+                RobotId(2),
             ),
         )
         .await;

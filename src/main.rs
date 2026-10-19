@@ -15,6 +15,8 @@ mod util;
 mod ros2;
 #[cfg(feature = "talos")]
 mod talos;
+#[cfg(feature = "bench")]
+mod bench;
 
 use avian3d::prelude::*;
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
@@ -39,15 +41,15 @@ use crate::setup::setup;
 use crate::statistic::ProjectileStatistics;
 use crate::systems::{
     ChassisObservationFrame, ControllerState, FpsDisplayPlugin, GameplaySystems, HelpPlugin,
-    NoticePlugin, PerformancePlugin, PreviousKinematicState, change_appearance,
+    NoticePlugin, PerformancePlugin, PreviousKinematicState, RobotInputs, change_appearance,
     cleanup_projectiles, clear_controller_input, controller_dart_just_pressed,
     controller_shoot_pressed, dart_launch, focus_controls, following_controls, freecam_controls,
     gimbal_controls, gimbal_pid_controls, inset_controls, projectile_aerodynamics,
-    projectile_launch, remote_gimbal_controls, remote_vehicle_controls, sample_gamepad_controller,
-    sample_keyboard_controller, screenshot_on_f2, screenshot_saving, setup_picture_in_picture,
-    setup_projectile, switch_slapper_control, uav_launch, update_auto_aim_subscription,
-    update_camera_follow, update_camera_follow_slapper, update_chassis_observation,
-    update_picture_in_picture, vehicle_controls,
+    projectile_launch, remote_gimbal_controls, robot_vehicle_controls, route_robot_inputs,
+    sample_gamepad_controller, sample_keyboard_controller, screenshot_on_f2, screenshot_saving,
+    setup_picture_in_picture, setup_projectile, switch_slapper_control, uav_launch,
+    update_auto_aim_subscription, update_camera_follow, update_camera_follow_slapper,
+    update_chassis_observation, update_picture_in_picture,
 };
 use bevy_metalfx::MetalFxPlugin;
 
@@ -183,6 +185,7 @@ fn main() {
         .init_resource::<ProjectileStatistics>()
         .init_resource::<ChassisObservationFrame>()
         .init_resource::<PreviousKinematicState>()
+        .init_resource::<RobotInputs>()
         .insert_resource(controller_state_with_auto_aim_default())
         .register_type::<ProjectileStatistics>()
         .insert_resource(Gravity(Vec3::NEG_Y * 9.81))
@@ -219,8 +222,13 @@ fn main() {
                     focus_controls,
                     inset_controls,
                     switch_slapper_control,
-                    vehicle_controls.run_if(|mode: Res<CameraMode>| mode.0 != FollowingType::Free),
-                    remote_vehicle_controls,
+                    // Route the two hand-driven slots to their robots first, then
+                    // drive every robot from the resulting per-robot table. The
+                    // benchmark scenario evaluator (bench feature) edits the same
+                    // table between these two, which is what makes scripted and
+                    // hand-driven motion share one physics path.
+                    route_robot_inputs,
+                    robot_vehicle_controls,
                     gimbal_controls,
                     gimbal_pid_controls.run_if(|enabled: Res<SubscribeAutoAim>| {
                         enabled.load(std::sync::atomic::Ordering::Acquire)
@@ -289,6 +297,14 @@ fn main() {
     #[cfg(not(feature = "ros2"))]
     {
         info!("ROS2 integration disabled");
+    }
+
+    // After `ROS2Plugin`, whose build inserts the topic publishers this reads.
+    // `bench` implies `ros2`, so there is no `not(ros2)` case to handle.
+    #[cfg(feature = "bench")]
+    {
+        app.add_plugins(bench::BenchPlugin);
+        info!("benchmark v2 integration enabled");
     }
 
     #[cfg(feature = "talos")]

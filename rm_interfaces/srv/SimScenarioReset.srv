@@ -1,0 +1,37 @@
+# Benchmark v2, P1-B: reset the loaded scenario to its initial state.
+#
+# Contract (frozen):
+#  * Idempotent. Calling it with no scenario loaded is `success=true`, `phase=0`
+#    (never an error), and so is calling it twice in a row.
+#  * Resets, in one shot:
+#      - vehicle state: pose back to the scenario's spawn (or to the start-up
+#        snapshot for a robot whose scenario has no spawn), linear and angular
+#        velocity cleared, chassis yaw back to its baseline;
+#      - scripted drivers removed and `spawn_applied`/`spawn_error` re-derived, so
+#        no previous run's placement verdict leaks into the next one;
+#      - live projectiles despawned;
+#      - the scenario clock (`t_scenario = 0`), phase back to 0 (Idle);
+#      - `shot_seq` back to 0 together with the event state that keys off it
+#        (resolved shots, armour-contact set, shot tags / env-hit markers), so a
+#        new run's first shot can never be mistaken for an already-resolved one;
+#      - the fire path: pending fire latch, projectile cooldown and the 10 Hz
+#        command rate limiter;
+#      - the deviation metrics and `spawn_error`.
+#  * Replies within ~1 s; never blocks.
+#
+# Known constraints for same-process multi-scenario runs (each is fine for the
+# one-scenario-per-process batches, but a runner that reuses one process must
+# scope its keys to a run):
+#  * `shot_seq` is a per-run counter. It restarts at 1 after a reset/start, so it
+#    is unique *within* a run but NOT across runs of the same process. Do not use
+#    it to pair events across a reset/start boundary.
+#  * `sim_time_ns` in `/sim/gt/*` and `/sim/events/*` is the scenario clock
+#    (`t_scenario` in ns). It restarts at 0 with `t_scenario`, so it is monotonic
+#    inside one run only; a run's timeline must be re-anchored at each `start`.
+
+---
+bool success
+string message
+string scenario_id
+uint8 phase            # 0 idle after a successful reset
+bool spawn_applied     # current value at reply time (false until the next start)

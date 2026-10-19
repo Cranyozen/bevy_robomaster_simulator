@@ -319,6 +319,26 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     export CMAKE_IDL_PACKAGES="$(python3 /usr/local/bin/ros_idl_packages.py)"; \
     echo "CMAKE_IDL_PACKAGES=${CMAKE_IDL_PACKAGES}"; \
     echo "IDL_PACKAGE_FILTER=${IDL_PACKAGE_FILTER}"; \
+    # --- stale r2r bindings ---------------------------------------------------
+    # `r2r` and `r2r_msg_gen` cache what they generate under
+    # `OUT_DIR/<sha256 of the watched env vars>`, and that hash covers only the
+    # environment (AMENT_PREFIX_PATH, CMAKE_IDL_PACKAGES, IDL_PACKAGE_FILTER,
+    # ROS_DISTRO) -- never the `.msg`/`.srv` files themselves. Since
+    # /app/target is a BuildKit cache that survives across builds, a rebuilt
+    # `rm_interfaces` (a new message, a changed field) leaves those caches
+    # looking perfectly fresh, and the failure is either
+    #   error[E0432]: no `SimEvent` in `...rm_interfaces::msg`
+    # or, when only msg_gen's introspection table is stale,
+    #   code generation error: rm_interfaces__msg__SimArmorState
+    # Dropping the cached output forces both to regenerate. `r2r_rcl` and
+    # `r2r_common` are left alone: they are IDL-independent and rebinding the
+    # rcl C API is the expensive part of this stage.
+    rm -rf target/release/build/r2r-* \
+           target/release/build/r2r_msg_gen-* \
+           target/release/build/r2r_actions-* \
+           target/release/.fingerprint/r2r-* \
+           target/release/.fingerprint/r2r_msg_gen-* \
+           target/release/.fingerprint/r2r_actions-*; \
     cargo build --release --locked --features "${CARGO_FEATURES}"; \
     # --- ANTI-FALSE-PASS GATE -------------------------------------------------
     # A cached stub artefact once made this step report "Finished in 0.30s" and

@@ -1,0 +1,30 @@
+# Benchmark v2, P1-B: load the scenario in `scenario_path` and keep its clock
+# idle. Parsing/validation only -- nothing moves until `SimScenarioStart`.
+#
+# Contract (frozen):
+#  * On ANY failure the **currently running scenario is left completely
+#    untouched**: it keeps running, `t_scenario` keeps advancing, its robots keep
+#    their poses and drivers, and the reply is `success=false` with the raw error
+#    text in `message` plus `scenario_id`/`seed`/`phase` describing *that* still
+#    running scenario. A rejected load has no side effects at all (idempotent:
+#    two status frames taken before/after a failed load are identical), so a
+#    caller can never mistake a failure for a successfully loaded scenario, and
+#    the simulator is never left in a half-loaded state.
+#  * `spawn_applied` is the value of the scenario this reply refers to: after a
+#    successful load that is the newly loaded scenario (`false` while its spawns
+#    are still pending, trivially `true` if it asks for none). It does NOT mean
+#    "the new scenario's spawns landed". The settled value for the run is
+#    `/sim/scenario/status` after `start`.
+#  * Must reply within ~1 s: never blocks waiting for spawn.
+#  * Loading a scenario does not drive anything: the caller decides when to start,
+#    so `trigger` in the TOML is overridden by the explicit `start` service.
+
+string scenario_path   # absolute path inside the container, e.g. /scenarios/dyn_line_2.toml
+int64 seed             # 0 = keep the seed from the TOML; non-zero overrides it
+---
+bool success
+string message         # raw parse/validation error when success=false
+string scenario_id     # scenario actually loaded ("" when nothing is loaded)
+int64 seed             # effective seed after the TOML value and the override
+uint8 phase            # 0 idle, 1 running, 2 done
+bool spawn_applied     # current value at reply time, see above

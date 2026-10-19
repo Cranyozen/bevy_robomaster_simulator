@@ -3,20 +3,13 @@ use crate::robomaster::prelude::{
     Activation, MechanismState, PowerRune, PowerRuneMechanism, PowerRuneRotation, RuneMode, Team,
 };
 use crate::talos::capture::{TalosCaptureContext, TalosFrameStamp};
-use crate::talos::plugin::M_ALIGN_MAT3;
+use crate::util::gt::{ros_yaw as shared_ros_yaw, team_u8 as shared_team_u8, to_ros_vec3};
 use avian3d::prelude::AngularVelocity;
 use bevy::prelude::*;
 use talos_ipc::*;
 
-fn to_ros_vec3(v: Vec3) -> Vec3 {
-    M_ALIGN_MAT3 * v
-}
-
 fn team_to_u8(team: &Team) -> u8 {
-    match team {
-        Team::Red => 0,
-        Team::Blue => 1,
-    }
+    shared_team_u8(*team)
 }
 
 fn activation_to_u8(a: &Activation) -> u8 {
@@ -46,13 +39,10 @@ fn rune_mode_to_u8(m: &RuneMode) -> u8 {
 
 /// Compute yaw in the ROS reference frame from a Bevy GlobalTransform.
 ///
-/// The alignment matrix maps Bevy (Y-up) → ROS (Z-up).
-/// We convert the rotation quaternion through the alignment to extract the Z-up yaw.
+/// Delegates to [`crate::util::gt::ros_yaw`] so the Talos ground truth and the
+/// benchmark's `/sim/gt/*` topics cannot disagree about which way a robot faces.
 fn ros_yaw(global_tf: &GlobalTransform) -> f32 {
-    let align_quat = Quat::from_mat3(&M_ALIGN_MAT3);
-    let ros_rot = align_quat * global_tf.rotation() * align_quat.inverse();
-    let (_, _, yaw) = ros_rot.to_euler(EulerRot::ZYX);
-    yaw
+    shared_ros_yaw(global_tf.rotation())
 }
 
 pub fn publish_ground_truth_system(

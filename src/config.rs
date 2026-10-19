@@ -29,6 +29,78 @@ pub struct SimulationConfig {
     pub mecanum: MecanumConfig,
     pub projectile: ProjectileConfig,
     pub camera: CameraConfig,
+    #[serde(default)]
+    pub bench: BenchConfig,
+}
+
+/// Benchmark v2 knobs, from `config.toml` → `[bench]`.
+///
+/// Only the scenario *path* lives here, never the scenario itself: the runner
+/// edits `config.toml` with line-level scalar overrides (`tools/benchmark/plan.py`),
+/// which cannot express tables or arrays. The scenario is a separate TOML file
+/// (see `src/bench/scenario.rs`) so one config can point at any case.
+#[derive(Deserialize, Reflect, Clone)]
+#[serde(default)]
+pub struct BenchConfig {
+    /// Master switch. `false` is the shipped value, and means the benchmark
+    /// systems are registered but do nothing — a normal simulator run is
+    /// unaffected even in a `bench` build.
+    pub enabled: bool,
+    /// Scenario file to run, e.g. `/scenarios/dyn_line_2.toml`. Relative paths
+    /// resolve against the process working directory.
+    pub scenario_path: String,
+    /// `/sim/gt/robots` publish rate in Hz. `0`/invalid publishes every frame;
+    /// 50 Hz is the contract default (`IMPLEMENTATION_PLAN.md` §3.3).
+    pub gt_robots_hz: f32,
+    /// Close an explicit velocity loop on the **scripted** robots, so a
+    /// scenario's `v` becomes a real target speed. The shared vehicle model is a
+    /// direction actuator — `linear_accelerate` normalises
+    /// `forward * stick.y + right * stick.x`, so the stick's magnitude never
+    /// reaches the physics and `line v=1` and `line v=6` produce the same
+    /// thrust (measured: 1.7 m/s vs 1.2 m/s). The servo only rewrites the
+    /// movement/boost of inputs the scenario wrote, never the keyboard/gamepad
+    /// path, and `false` restores the raw open-loop stick for A/B runs.
+    pub speed_servo: bool,
+    /// Attribution radius for `hit_armor` events, in metres.
+    ///
+    /// A plate hit is attributed to the plate whose **centre** is closest to the
+    /// sweep-recovered `contact_point` (see `bench/events.rs`), not to the
+    /// collider avian happened to report: with the unbounded speculative margin
+    /// the collision can start on a neighbouring plate ~0.2 m early. When the
+    /// nearest centre is farther than this radius the event keeps the collider's
+    /// plate and logs the fallback (`[bench][hitid]`).
+    ///
+    /// 0.25 m sits between the two populations measured on the phase bed: a
+    /// genuine contact misses its plate centre by 15–110 mm, a mis-attributed
+    /// neighbour by 230–344 mm. The radius of the plate ring itself is ≈0.212 m,
+    /// so a tighter value would start rejecting real hits on the far side of a
+    /// plate; a looser one would re-admit neighbours.
+    pub hit_armor_id_max_offset_m: f32,
+}
+
+impl Default for BenchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scenario_path: String::new(),
+            gt_robots_hz: 50.0,
+            speed_servo: true,
+            hit_armor_id_max_offset_m: 0.25,
+        }
+    }
+}
+
+impl BenchConfig {
+    /// Period between `/sim/gt/robots` messages, or `None` for every frame.
+    pub fn gt_robots_period(&self) -> Option<Duration> {
+        period_from_hz(self.gt_robots_hz)
+    }
+
+    /// The scenario file to load, or `None` when the path is unset/blank.
+    pub fn scenario_path(&self) -> Option<&Path> {
+        let path = self.scenario_path.trim();
+        (!path.is_empty()).then(|| Path::new(path))
+    }
 }
 
 #[derive(Deserialize, Reflect, Clone)]
@@ -150,6 +222,19 @@ pub struct RenderConfig {
     /// Number of shadow cascades, clamped to `1..=4`. `0` keeps the engine
     /// default (4). Fewer cascades means fewer shadow passes per light.
     pub shadow_cascades: u32,
+    /// MSAA sample count for the **capture** camera, i.e. the camera whose image
+    /// is encoded and published to the SUT. `0` (and `1`) keeps the shipped
+    /// behaviour (`Msaa::Off`); `2`, `4` and `8` select `Msaa::Sample2/4/8`.
+    /// Anything else falls back to `Msaa::Off` with a warning.
+    ///
+    /// Only the antialiasing of the intermediate that the effect pass reads
+    /// changes; the on-screen camera is unaffected (`main_camera_fxaa` covers
+    /// it). Added for the detection-envelope separation experiment: at the
+    /// 4.04 m probe the armour number is 20.8 x 32.6 px with ~5 px strokes, so
+    /// whether edge antialiasing moves the SUT's number classification has to be
+    /// separated from `[capture.color] jpeg_quality` and `[capture.effect]
+    /// grain`.
+    pub capture_msaa: u32,
 }
 
 impl Default for RenderConfig {
@@ -164,6 +249,7 @@ impl Default for RenderConfig {
             view_distance: 0.0,
             shadow_max_distance: 0.0,
             shadow_cascades: 0,
+            capture_msaa: 0,
         }
     }
 }
@@ -733,6 +819,7 @@ impl Default for SimulationConfig {
                     uav_vel: 2.0,
                 },
                 camera: CameraConfig::default(),
+                bench: BenchConfig::default(),
             }
         })
     }
@@ -1115,5 +1202,35 @@ mod tests {
             0.0,
             "出厂配置必须保持零畸变，PnP 才对得上 camera_info"
         );
+    }
+
+    #[test]
+    fn bench_section_tolerates_missing_fields_and_defaults_off() {
+        // An older config.toml has no `[bench]` at all, and the shipped one must
+        // not switch a benchmark scenario on by itself.
+        let bench: BenchConfig =
+            toml::from_str("scenario_path = \"/scenarios/x.toml\"\n").expect("partial [bench]");
+
+        assert!(!bench.enabled, "出厂默认关闭");
+        assert_eq!(bench.gt_robots_hz, 50.0, "契约默认 50 Hz");
+        assert!(bench.speed_servo, "伺服默认开启：脚本 v 就是目标速度");
+        assert_eq!(bench.scenario_path(), Some(Path::new("/scenarios/x.toml")));
+        assert!(
+            (bench.gt_robots_period().unwrap().as_secs_f64() - 0.02).abs() < 1e-9,
+            "50 Hz = 20 ms"
+        );
+    }
+
+    #[test]
+    fn bench_scenario_path_treats_blank_as_unset() {
+        let unset = BenchConfig::default();
+        let blank = BenchConfig {
+            scenario_path: "   ".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!unset.enabled);
+        assert_eq!(unset.scenario_path(), None, "空路径不是场景");
+        assert_eq!(blank.scenario_path(), None, "空白也不算路径");
     }
 }

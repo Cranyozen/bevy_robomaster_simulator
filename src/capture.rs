@@ -39,6 +39,15 @@ pub fn setup_capture_camera(world: &mut World) {
     let render_target_handle = world.resource::<ImageHandle>().0.clone();
     let fov = world.resource::<CameraFov>().0;
 
+    // `[render] capture_msaa` (0 = the shipped `Msaa::Off`). Only this camera is
+    // affected: its image is the one the effect pass reads and the encoder
+    // publishes, which is what the SUT sees.
+    let msaa = capture_msaa(
+        world
+            .get_resource::<SimulationConfig>()
+            .map_or(0, |config| config.render.capture_msaa),
+    );
+
     // The clean copy of this view that the lens-simulation preview toggles to.
     // Created here because it has to match the capture target's size and format
     // exactly; see `effect::insert_raw_preview_target`.
@@ -67,12 +76,31 @@ pub fn setup_capture_camera(world: &mut World) {
             far: 10000.0,
             ..default()
         }),
-        Msaa::Off,
+        msaa,
         DepthPrepass,
         CaptureCamera,
     ));
     if let Some(metalfx) = metalfx {
         capture_camera.insert(metalfx);
+    }
+}
+
+/// Maps `[render] capture_msaa` onto Bevy's sample counts.
+///
+/// `0` (the default) and `1` both mean `Msaa::Off`; `2`, `4` and `8` select
+/// `Msaa::Sample2/4/8`. Anything else is a configuration mistake and
+/// `Msaa::from_samples` panics on it: warn and keep the shipped behaviour
+/// instead of taking the simulator down over a typo.
+fn capture_msaa(samples: u32) -> Msaa {
+    match samples {
+        0 | 1 => Msaa::Off,
+        2 | 4 | 8 => Msaa::from_samples(samples),
+        other => {
+            bevy::log::warn!(
+                "[config] render.capture_msaa = {other} is not one of 0/1/2/4/8; using Msaa::Off"
+            );
+            Msaa::Off
+        }
     }
 }
 
@@ -176,3 +204,26 @@ pub fn compute_camera_intrinsics(width: u32, height: u32, fov_y: f32) -> CameraI
 
 pub const IMAGE_WIDTH: u32 = 1440;
 pub const IMAGE_HEIGHT: u32 = 1080;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_msaa_maps_the_configured_sample_count() {
+        assert_eq!(capture_msaa(0), Msaa::Off);
+        assert_eq!(capture_msaa(1), Msaa::Off);
+        assert_eq!(capture_msaa(2), Msaa::Sample2);
+        assert_eq!(capture_msaa(4), Msaa::Sample4);
+        assert_eq!(capture_msaa(8), Msaa::Sample8);
+        // Unsupported counts fall back to the shipped behaviour rather than
+        // panicking in `Msaa::from_samples`.
+        assert_eq!(capture_msaa(3), Msaa::Off);
+        // The default path is bit-identical to what the simulator shipped before
+        // `[render] capture_msaa` existed: the default config value maps to Off,
+        // and `Msaa::Off` is what the capture camera used to hard-code.
+        let default_samples = crate::config::RenderConfig::default().capture_msaa;
+        assert_eq!(default_samples, 0, "the shipped default must stay `Msaa::Off`");
+        assert_eq!(capture_msaa(default_samples), Msaa::Off);
+    }
+}

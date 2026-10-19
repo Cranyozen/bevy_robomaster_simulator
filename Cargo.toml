@@ -16,6 +16,12 @@ default-run = "daedalus"
 
 [features]
 ros2 = ["dep:r2r"]
+# Benchmark v2. `bench` is strictly additive on top of `ros2`: it needs the node,
+# the `/tf` clock and `r2r`'s generated `Sim*` bindings, and a plain `ros2` build
+# must stay byte-for-byte the v1 measurement surface. Because it is an ordinary
+# cargo feature (not a runtime flag), anything `bench`-only lives behind
+# `#[cfg(feature = "bench")]` and the default build is untouched.
+bench = ["ros2"]
 talos = ["dep:talos-ipc"]
 ffmpeg = ["dep:ffmpeg-next"]
 default = ["talos"]

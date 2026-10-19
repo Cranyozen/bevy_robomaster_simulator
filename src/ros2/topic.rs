@@ -34,6 +34,8 @@ struct Mailbox<T> {
 struct MailboxInner<T> {
     queue: VecDeque<T>,
     closed: bool,
+    /// Messages evicted because the queue was full (the drop-oldest policy).
+    dropped: usize,
 }
 
 impl<T> Mailbox<T> {
@@ -42,6 +44,7 @@ impl<T> Mailbox<T> {
             inner: Mutex::new(MailboxInner {
                 queue: VecDeque::new(),
                 closed: false,
+                dropped: 0,
             }),
             ready: Condvar::new(),
             capacity: capacity.max(1),
@@ -55,9 +58,25 @@ impl<T> Mailbox<T> {
         }
         while inner.queue.len() >= self.capacity {
             inner.queue.pop_front();
+            inner.dropped += 1;
         }
         inner.queue.push_back(message);
         self.ready.notify_one();
+    }
+
+    /// Non-blocking `pop_front`: `None` when nothing is queued. Subscribers drain
+    /// from the ECS side, where blocking would stall a frame.
+    fn try_pop(&self) -> Option<T> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.queue.pop_front()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().queue.len()
+    }
+
+    fn dropped(&self) -> usize {
+        self.inner.lock().unwrap().dropped
     }
 
     /// Blocks until a message arrives or the wait times out; `None` means "call
@@ -107,37 +126,55 @@ impl<T: RosTopic> TopicPublisher<T> {
     }
 }
 
+/// Inbound side of a topic: a bounded queue drained once per frame.
+///
+/// A single slot (keep the newest, forget the rest) is right for a state stream,
+/// but `/rm_gimbal/cmd` is a *command* stream: a 10 Hz `fire_advice` pulse is
+/// 60 ms wide — 5-6 messages — and no later message repeats the order, so a slot
+/// silently throws commanded shots away (measured: 20 commanded pulses produced
+/// 4 shots). The queue keeps everything that arrived since the last drain; on
+/// overflow the oldest is evicted (a newer state still wins) and `dropped()`
+/// counts the loss.
 #[derive(Resource)]
 pub struct TopicSubscriber<T: RosTopic> {
-    receiver: Arc<Mutex<Option<T::T>>>,
+    mailbox: Arc<Mailbox<T::T>>,
 }
 
 impl<T: RosTopic> TopicSubscriber<T> {
     pub(super) fn new() -> Self {
         TopicSubscriber {
-            receiver: Arc::new(Mutex::new(None)),
+            mailbox: Arc::new(Mailbox::new(T::QUEUE)),
         }
     }
 
-    /// Takes the most recent message; older ones are already gone.
+    /// Takes the oldest queued message; `None` means the queue is drained.
     pub fn try_recv(&self) -> Option<T::T> {
-        self.receiver.lock().unwrap().take()
+        self.mailbox.try_pop()
+    }
+
+    /// Messages waiting for the next drain.
+    pub fn queued(&self) -> usize {
+        self.mailbox.len()
+    }
+
+    /// Messages evicted by the drop-oldest policy since start-up.
+    pub fn dropped(&self) -> usize {
+        self.mailbox.dropped()
     }
 }
 
 fn subscriber<T: RosTopic>(node: &mut Node, signal: Arc<AtomicBool>) -> TopicSubscriber<T> {
     let mut subscriber = node.subscribe::<T::T>(T::TOPIC, T::QOS).unwrap();
     let sub = TopicSubscriber::new();
-    let mutex = sub.receiver.clone();
+    let mailbox = sub.mailbox.clone();
     std::thread::spawn(move || {
         while !signal.load(std::sync::atomic::Ordering::Acquire) {
             match block_on(futures_lite::StreamExt::next(&mut subscriber)) {
-                Some(msg) => {
-                    mutex.lock().unwrap().replace(msg);
-                }
+                Some(msg) => mailbox.push(msg),
                 None => continue,
             }
         }
+        mailbox.close();
     });
     sub
 }
@@ -220,7 +257,11 @@ macro_rules! topic {
     };
     (sub {$($url:literal as $msg_typ:ty as $topic:ident $(queue $queue:tt)? $(with $qos: expr)?;)*} $($remaining:tt)*) => {
         $(
-            topic!($topic, $msg_typ, $url $(, $qos)?);
+            // The subscriber is a bounded queue (see `TopicSubscriber`), so the
+            // declared depth is how many messages the ECS can still drain on the
+            // next frame. `queue N` needs `with <qos>` on this side: a bare
+            // `queue` would bind to the four-argument arm's QoS slot.
+            topic!($topic, $msg_typ, $url $(, $qos)? $(, $queue)?);
         )*
 
         pub fn register_sub(atomic:Arc<AtomicBool>, app:&mut App, node:&mut Node) {
@@ -264,9 +305,53 @@ topic!(
         "/simulator/tech_core/state" as RosString as TechCoreStateTopic with QosProfile::default();
     }
     sub {
-        "/rm_gimbal/cmd" as GimbalCmd as GimbalCmdTopic with QosProfile::sensor_data();
+        // A command stream, not a state stream: the bench sends ~2 Hz `fire_advice`
+        // pulses that are 60 ms wide (5-6 messages each), and a refused attempt must
+        // not eat the order. 32 messages ≈ 0.35 s of the measured 91 Hz command
+        // stream, i.e. every pulse survives a frame; on overflow the oldest goes
+        // first and `TopicSubscriber::dropped()` counts it.
+        "/rm_gimbal/cmd" as GimbalCmd as GimbalCmdTopic queue 32 with QosProfile::sensor_data();
     }
 );
+
+/// Benchmark v2 topics (`IMPLEMENTATION_PLAN.md` §3.3).
+///
+/// Feature-gated on purpose. An `ros2`-only build is the v1 measurement surface
+/// and must not even create these publishers, let alone publish on them; the
+/// benchmark publishes only when `--features bench` and `[bench] enabled` are
+/// both set. `bench` implies `ros2`, so this module is only ever compiled when
+/// the node it registers into exists.
+///
+/// QoS is per topic again, and for the same reason as above — but the deciding
+/// property is not size, it is whether a lost message is a *wrong measurement*:
+///
+/// - GT (`/sim/gt/*`, `/sim/scenario/status`) is a high-rate periodic stream.
+///   Best-effort is correct: a retransmitted frame is already stale, and gaps are
+///   the scorer's `gt_frame_coverage` to report, not DDS's to paper over.
+/// - Events (`/sim/events/*`) are sparse and must not be lost — a dropped
+///   `hit_armor` silently lowers the hit rate. They are small, so paying for
+///   reliable delivery costs almost nothing, and a deep queue absorbs the burst
+///   at the end of a magazine.
+#[cfg(feature = "bench")]
+pub mod bench_topics {
+    use super::*;
+    use r2r::rm_interfaces::msg::{SimArmorStates, SimEvent, SimRobotStates, SimScenarioStatus};
+
+    topic!(
+        pub {
+            "/sim/gt/robots" as SimRobotStates as SimGtRobotsTopic queue 4
+                with QosProfile::sensor_data().best_effort().keep_last(4);
+            "/sim/gt/armors" as SimArmorStates as SimGtArmorsTopic queue 4
+                with QosProfile::sensor_data().best_effort().keep_last(4);
+            "/sim/events/fire" as SimEvent as SimFireEventTopic queue 32
+                with QosProfile::default().reliable().keep_last(32);
+            "/sim/events/hit" as SimEvent as SimHitEventTopic queue 32
+                with QosProfile::default().reliable().keep_last(32);
+            "/sim/scenario/status" as SimScenarioStatus as SimScenarioStatusTopic queue 4
+                with QosProfile::sensor_data().best_effort().keep_last(4);
+        }
+    );
+}
 
 #[cfg(test)]
 mod tests {
@@ -314,6 +399,50 @@ mod tests {
     }
 
     #[test]
+    fn subscriber_queue_keeps_every_message_until_drained() {
+        // A command pulse is several messages wide; none of them may be replaced
+        // by a later message before the ECS gets to drain the queue.
+        let mailbox: Mailbox<u32> = Mailbox::new(8);
+
+        for message in 0..8 {
+            mailbox.push(message);
+        }
+
+        assert_eq!(mailbox.len(), 8);
+        for expected in 0..8 {
+            assert_eq!(mailbox.try_pop(), Some(expected));
+        }
+        assert_eq!(mailbox.try_pop(), None);
+        assert_eq!(mailbox.dropped(), 0, "nothing was evicted below capacity");
+    }
+
+    #[test]
+    fn subscriber_overflow_drops_the_oldest_and_counts_it() {
+        let mailbox: Mailbox<u32> = Mailbox::new(2);
+
+        mailbox.push(1);
+        mailbox.push(2);
+        mailbox.push(3);
+
+        assert_eq!(mailbox.dropped(), 1);
+        assert_eq!(mailbox.try_pop(), Some(2));
+        assert_eq!(mailbox.try_pop(), Some(3));
+        assert_eq!(mailbox.try_pop(), None);
+    }
+
+    #[test]
+    fn gimbal_cmd_subscription_depth_covers_a_fire_pulse() {
+        // The bench fires ~2 Hz pulses that are 60 ms wide, at ~91 Hz of command
+        // messages: a depth of 8 (the old implicit default) is not a frame's
+        // worth of input, and a slot of 1 threw 16 of 20 commanded pulses away.
+        assert!(
+            <GimbalCmdTopic as RosTopic>::QUEUE >= 16,
+            "the command stream must survive a frame: QUEUE = {}",
+            <GimbalCmdTopic as RosTopic>::QUEUE
+        );
+    }
+
+    #[test]
     fn mailbox_pop_waits_for_a_later_push() {
         let mailbox = Arc::new(Mailbox::new(4));
         let producer = mailbox.clone();
@@ -358,5 +487,43 @@ mod tests {
     #[test]
     fn compressed_topic_follows_image_transport_naming() {
         assert_eq!(ImageCompressedTopic::TOPIC, "/image_raw/compressed");
+    }
+
+    /// The topic names and QoS classes here are a frozen cross-team contract
+    /// (`IMPLEMENTATION_PLAN.md` §3.3): the recorder and the scorer are written
+    /// against them in parallel. Pin them so a rename cannot land quietly.
+    #[cfg(feature = "bench")]
+    #[test]
+    fn sim_topics_match_the_frozen_contract() {
+        use super::bench_topics::*;
+        use r2r::qos::ReliabilityPolicy;
+
+        assert_eq!(SimGtRobotsTopic::TOPIC, "/sim/gt/robots");
+        assert_eq!(SimGtArmorsTopic::TOPIC, "/sim/gt/armors");
+        assert_eq!(SimFireEventTopic::TOPIC, "/sim/events/fire");
+        assert_eq!(SimHitEventTopic::TOPIC, "/sim/events/hit");
+        assert_eq!(SimScenarioStatusTopic::TOPIC, "/sim/scenario/status");
+
+        assert_eq!(SimGtRobotsTopic::QUEUE, 4);
+        assert_eq!(SimGtArmorsTopic::QUEUE, 4);
+        assert_eq!(SimScenarioStatusTopic::QUEUE, 4);
+        assert_eq!(
+            SimFireEventTopic::QUEUE,
+            32,
+            "events are unreliable only if DDS drops them: they must not be"
+        );
+        assert_eq!(SimHitEventTopic::QUEUE, 32);
+
+        assert_eq!(
+            SimGtRobotsTopic::QOS.reliability,
+            ReliabilityPolicy::BestEffort
+        );
+        assert_eq!(SimGtArmorsTopic::QOS.reliability, ReliabilityPolicy::BestEffort);
+        assert_eq!(
+            SimScenarioStatusTopic::QOS.reliability,
+            ReliabilityPolicy::BestEffort
+        );
+        assert_eq!(SimFireEventTopic::QOS.reliability, ReliabilityPolicy::Reliable);
+        assert_eq!(SimHitEventTopic::QOS.reliability, ReliabilityPolicy::Reliable);
     }
 }
